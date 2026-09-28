@@ -5,7 +5,7 @@
   "version": "1.0.0",
   "author": "David JM",
   "license": "MIT",
-  "description": "Generate Omarchy themes from wallpapers, browse the palette, edit a theme's colours, rename and remove your themes, and manage a theme's backgrounds. Summon with: omarchy-shell shell summon davidjm.theme-studio '{}'",
+  "description": "Generate Omarchy themes from wallpapers, add wallpapers to an existing theme, browse the palette, edit a theme's colours, rename and remove your themes, and manage a theme's backgrounds. Summon with: omarchy-shell shell summon davidjm.theme-studio '{}'",
   "kinds": [
     "overlay"
   ],

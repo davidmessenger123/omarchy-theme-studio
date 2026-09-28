@@ -32,6 +32,14 @@ Item {
   property var candidates: []
   property var chosen: []
   property string newName: ""
+  // Set to a slug when the picker is adding wallpapers to an existing theme
+  // rather than creating one; "" means create. The picker is shared, so the
+  // mode lives here and every page reads it.
+  property string addTarget: ""
+  // With --add, the palette is re-derived from the whole set by default, which
+  // would discard edits made on the Colours page. Keeping the colours is the
+  // less destructive default, so re-deriving is opt-in.
+  property bool keepColors: true
   // Set to a slug before reloading so the list can follow a row that changed
   // name, rather than resetting the selection to the active theme.
   property string pendingFollowOld: ""
@@ -388,10 +396,37 @@ Item {
 
   // One place that switches panes, so the tab strip and the Ctrl+Tab shortcut
   // cannot drift apart and every page gets the setup it needs on entry.
-  function showTab(index) {
+  // `addTo` is the theme the wallpaper picker should add to, if any.
+  function showTab(index, addTo) {
     stack.currentIndex = index
-    if (index === 1) loadCandidates()
+    if (index === 1) {
+      addTarget = addTo || ""
+      loadCandidates()
+      // The grid takes the keyboard so the wallpapers can be chosen with the
+      // arrows and Enter straight away.
+      Qt.callLater(function() { candidateGrid.forceActiveFocus() })
+    }
     if (index === 2) startColorEditing()
+  }
+
+  function startAddingWallpapers() {
+    if (!root.current || !root.current.user) {
+      say("Wallpapers can only be added to one of your own themes.", true)
+      return
+    }
+    showTab(1, root.current.slug)
+    say("Adding wallpapers to " + addTarget + ".")
+  }
+
+  function toggleCandidateAtCursor() {
+    var index = candidateGrid.currentIndex
+    if (index < 0 || index >= candidates.length) return
+    toggleCandidate(candidates[index].path)
+  }
+
+  function cancelAddingWallpapers() {
+    addTarget = ""
+    say("")
   }
 
   function generateTheme() {
@@ -399,20 +434,28 @@ Item {
       say("Select at least one image.", true)
       return
     }
-    var name = newName.trim()
-    if (!name) {
-      say("Give the theme a name.", true)
-      return
+    if (addTarget === "") {
+      if (!newName.trim()) {
+        say("Give the theme a name.", true)
+        return
+      }
+      say("Generating theme from " + chosen.length + " image(s)...")
+    } else {
+      say("Adding " + chosen.length + " image(s) to " + addTarget
+          + (keepColors ? "..." : ", re-deriving its palette..."))
     }
-    say("Generating theme from " + chosen.length + " image(s)...")
     generateProc.running = true
   }
 
   function generateCommand() {
     var argv = ["/usr/bin/python3", "-I", root.tool]
     for (var i = 0; i < chosen.length; i++) argv.push(chosen[i])
-    argv.push("--name")
-    argv.push(newName.trim())
+    if (addTarget !== "") {
+      argv.push("--name", addTarget, "--add")
+      if (keepColors) argv.push("--keep-colors")
+    } else {
+      argv.push("--name", newName.trim())
+    }
     return argv
   }
 
@@ -607,14 +650,25 @@ Item {
 
   Process {
     id: generateProc
-    stdout: StdioCollector { waitForEnd: true }
+    property string output: ""
+    // The tool reports things worth keeping -- images converted to png, a
+    // wallpaper that was already there -- so show what it said rather than
+    // replacing it with a generic message.
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: generateProc.output = String(text || "").trim()
+    }
     stderr: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.say(String(text || "").trim(), true)
     }
     onExited: {
       if (root.statusIsError) return
-      root.say("Generated " + newName.trim() + ".")
+      var lines = generateProc.output.split("\n").filter(function(l) { return l !== "" })
+      if (lines.length) root.say(lines.join(" "))
+      else if (root.addTarget !== "") root.say("Added wallpapers to " + root.addTarget + ".")
+      else root.say("Generated " + newName.trim() + ".")
+      root.addTarget = ""
       root.clearChosen()
       root.loadThemes()
     }
@@ -662,6 +716,66 @@ Item {
     }
   }
 
+  // Like ActionButton, an inline component cannot reach the enclosing `root`,
+  // so this one carries its state in its own properties and reports through a
+  // signal rather than writing to a shared one.
+  component ToggleChip: Rectangle {
+    id: chip
+    property string label: ""
+    property bool checked: false
+    signal toggled()
+
+    // `enabled` is inherited from QQuickItem rather than redeclared, so the
+    // opacity and the click gate below stay in sync.
+    implicitWidth: chipRow.implicitWidth + Style.space(22)
+    implicitHeight: Style.space(36)
+    radius: Style.cornerRadius
+    opacity: enabled ? 1 : 0.45
+    color: chip.checked ? Color.accent
+                          : (chipMouse.containsMouse ? Color.background.lighter(1.25) : Color.background)
+    border.width: 1
+    border.color: chip.checked ? Color.accent
+                                : (chipMouse.containsMouse ? Color.accent : Qt.alpha(Color.foreground, 0.22))
+
+    RowLayout {
+      id: chipRow
+      anchors.centerIn: parent
+      spacing: Style.space(8)
+
+      Rectangle {
+        implicitWidth: 14
+        implicitHeight: 14
+        radius: 7
+        color: chip.checked ? Color.background : "transparent"
+        border.width: 1
+        border.color: chip.checked ? Color.background : Qt.alpha(Color.foreground, 0.5)
+        Text {
+          anchors.centerIn: parent
+          visible: chip.checked
+          text: "✓"
+          color: Color.accent
+          font.pixelSize: 9
+          font.weight: Font.Bold
+        }
+      }
+
+      Text {
+        text: chip.label
+        color: chip.checked ? Color.background : Color.foreground
+        font.pixelSize: Style.font.body
+        font.weight: Font.DemiBold
+      }
+    }
+
+    MouseArea {
+      id: chipMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+      onClicked: if (chip.enabled) chip.toggled()
+    }
+  }
+
   PanelWindow {
     id: panel
 
@@ -699,17 +813,31 @@ Item {
           root.showTab((stack.currentIndex + step + 3) % 3)
           return
         }
+        // Generate-only: hand the keyboard to the wallpaper grid, but only when
+        // it does not already have it, so the arrows are not swallowed.
+        if (stack.currentIndex === 1) {
+          if ((event.key === Qt.Key_Down || event.key === Qt.Key_Tab)
+              && !candidateGrid.activeFocus)
+            candidateGrid.forceActiveFocus()
+          return
+        }
         // Browse-only shortcuts. The colour list handles its own arrows, and
         // yanking focus to the sidebar from there would strand the user.
         if (stack.currentIndex !== 0) return
-        if (event.key === Qt.Key_Down) sidebarList.forceActiveFocus()
-        if (event.key === Qt.Key_Tab) sidebarList.forceActiveFocus()
-        // R opens the rename field, so the whole of Browse is reachable without
-        // a mouse. Guarded on !renaming so it cannot fire while the field has
-        // focus and Enter is on its way to commitRename.
-        if (event.key === Qt.Key_R && !root.renaming
-            && root.current !== null && root.current.user)
-          root.startRename()
+        // Only hand focus over when the list does not already have it: this
+        // handler accepts the event, so re-focusing on every press would
+        // swallow the arrow keys the list needs to move the selection.
+        if ((event.key === Qt.Key_Down || event.key === Qt.Key_Tab)
+            && !sidebarList.activeFocus)
+          sidebarList.forceActiveFocus()
+        // R and A open the rename field and the wallpaper picker, so the whole
+        // of Browse is reachable without a mouse. Guarded on !renaming so they
+        // cannot fire while that field has focus and Enter is on its way to
+        // commitRename.
+        if (!root.renaming && root.current !== null && root.current.user) {
+          if (event.key === Qt.Key_R) root.startRename()
+          if (event.key === Qt.Key_A) root.startAddingWallpapers()
+        }
       }
 
       Rectangle {
@@ -1069,6 +1197,11 @@ Item {
                     enabled: !renameProc.running
                     onClicked: root.startRename()
                   }
+                  ActionButton {
+                    label: "Add Wallpaper…"
+                    visible: root.current !== null && root.current.user
+                    onClicked: root.startAddingWallpapers()
+                  }
                   Item { Layout.fillWidth: true }
                   Text {
                     visible: root.current !== null && !root.current.user
@@ -1145,21 +1278,33 @@ Item {
               }
             }
 
-            // --- build a new theme
+            // --- build a new theme, or add wallpapers to an existing one
             Item {
               ColumnLayout {
                 anchors.fill: parent
                 spacing: Style.space(12)
 
                 Text {
-                  text: "New theme from wallpapers"
+                  text: root.addTarget !== ""
+                        ? "Add wallpapers to " + root.addTarget
+                        : "New theme from wallpapers"
                   color: Color.foreground
                   font.pixelSize: Style.font.title
                   font.weight: Font.Bold
                 }
 
+                Text {
+                  Layout.fillWidth: true
+                  visible: root.addTarget !== ""
+                  text: "The theme keeps its colours unless you ask for them to be re-derived."
+                  color: Color.muted
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+                }
+
                 RowLayout {
                   Layout.fillWidth: true
+                  visible: root.addTarget === ""
                   spacing: Style.space(8)
 
                   Rectangle {
@@ -1230,12 +1375,33 @@ Item {
                 }
 
                 GridView {
+                  id: candidateGrid
                   Layout.fillWidth: true
                   Layout.fillHeight: true
                   clip: true
                   model: root.candidates
                   cellWidth: 128
                   cellHeight: 96
+                  focus: true
+                  keyNavigationEnabled: true
+                  // Enter picks the highlighted image and Ctrl+Enter commits,
+                  // so a set of wallpapers can be chosen without a mouse. One
+                  // Keys.onPressed handles both, since a specific handler
+                  // would shadow it for Return.
+                  Keys.onPressed: function(event) {
+                    if (event.key === Qt.Key_Escape) {
+                      root.cancelAddingWallpapers()
+                      return
+                    }
+                    if (event.modifiers & Qt.ControlModifier) {
+                      if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)
+                        root.generateTheme()
+                      return
+                    }
+                    if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter
+                        || (event.text && event.text.length === 1))
+                      root.toggleCandidateAtCursor()
+                  }
                   ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
                   delegate: Item {
@@ -1295,16 +1461,48 @@ Item {
                   Layout.fillWidth: true
                   spacing: Style.space(8)
 
+                  ToggleChip {
+                    visible: root.addTarget !== ""
+                    label: "Keep current colours"
+                    checked: root.keepColors
+                    onToggled: root.keepColors = !root.keepColors
+                  }
+
                   ActionButton {
+                    visible: root.addTarget === ""
                     label: "Generate Theme"
                     enabled: root.chosen.length > 0
                     busy: generateProc.running
                     onClicked: root.generateTheme()
                   }
+
+                  ActionButton {
+                    visible: root.addTarget !== ""
+                    label: root.chosen.length === 1
+                          ? "Add 1 Wallpaper" : "Add " + root.chosen.length + " Wallpapers"
+                    enabled: root.chosen.length > 0
+                    busy: generateProc.running
+                    onClicked: root.generateTheme()
+                  }
+
+                  ActionButton {
+                    visible: root.addTarget !== ""
+                    label: "Cancel"
+                    enabled: !generateProc.running
+                    onClicked: root.cancelAddingWallpapers()
+                  }
+
+                  Item { Layout.fillWidth: true }
+
                   Text {
-                    text: "Several images become a set the theme cycles through."
-                    color: Color.muted
+                    text: root.addTarget !== ""
+                          ? (root.keepColors
+                             ? "Enter to pick, Ctrl+Enter to add. The theme cycles through the set."
+                             : "The palette will be re-derived from the whole set, discarding colour edits.")
+                          : "Enter to pick, Ctrl+Enter to generate. Several images become a set the theme cycles through."
+                    color: root.addTarget !== "" && !root.keepColors ? Color.urgent : Color.muted
                     font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
                   }
                 }
               }

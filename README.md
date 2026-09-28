@@ -13,8 +13,8 @@ Three panes, cycled with <kbd>Ctrl</kbd>+<kbd>Tab</kbd> (and the tab strip):
 
 | Pane | What it does |
 |---|---|
-| **Browse** | Palette and backgrounds of every theme, stock and yours. Apply, rename, remove. |
-| **Generate** | Derive a theme from one or more wallpapers in a folder. |
+| **Browse** | Palette and backgrounds of every theme, stock and yours. Apply, rename, add wallpapers, remove. |
+| **Generate** | Derive a new theme from wallpapers, or add wallpapers to one of your own. |
 | **Colours** | Edit any colour in your own theme's `colors.toml`. |
 
 ## Keyboard
@@ -24,12 +24,27 @@ The studio is fully operable without a mouse.
 | Key | Action |
 |---|---|
 | <kbd>Ctrl</kbd>+<kbd>Tab</kbd> | Next pane (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Tab</kbd> for previous) |
-| <kbd>Down</kbd> / <kbd>Tab</kbd> | Focus the theme list (Browse) |
+| <kbd>Down</kbd> / <kbd>Tab</kbd> | Focus the theme list (Browse) or the wallpaper grid (Generate) |
 | <kbd>R</kbd> | Rename the selected theme (Browse) |
-| <kbd>Enter</kbd> | Rename is only live in the rename field. |
+| <kbd>A</kbd> | Add wallpapers to the selected theme (Browse) |
+| <kbd>Enter</kbd> | In the rename field, commit. On the wallpaper grid, pick the highlighted image. |
+| <kbd>Ctrl</kbd>+<kbd>Enter</kbd> | Generate the theme, or add the picked wallpapers (Generate) |
 | <kbd>Up</kbd> / <kbd>Down</kbd> | Walk the colour rows, skipping group headers (Colours) |
 | <kbd>Enter</kbd> or any character | Start editing the highlighted colour (Colours) |
 | <kbd>Enter</kbd> | Save colours. <kbd>Escape</kbd> reverts and returns to the list. |
+
+## Adding wallpapers to a theme
+
+<kbd>A</kbd> on Browse, or **Add Wallpaper…**, sends the wallpaper picker at
+the selected theme instead of creating a new one. The added images join the set
+that `omarchy theme bg next` cycles through, and the theme is re-applied
+afterwards.
+
+**Keep current colours** is on by default, so the palette survives untouched.
+Turning it off re-derives the palette from the whole set — useful after adding a
+wallpaper that should change the theme, but it discards any edits made on the
+Colours page.
+
 
 ## Editing colours
 
