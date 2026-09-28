@@ -473,7 +473,7 @@ def default_name(image):
 
 # ------------------------------------------------------------------ inspection
 
-COLOR_KEYS = [key for key in ORDER if key != "mode"]
+COLOR_KEYS = [key for key in ORDER if key not in ("mode", *DERIVED_KEYS)]
 
 
 def read_colors(path):

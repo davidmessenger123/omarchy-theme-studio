@@ -61,6 +61,17 @@ Item {
     return rows
   }
 
+  // Only the keys the tool declared editable. Everything else in colors comes
+  // from the theme file and is not a hex colour -- the Hyprland borders are
+  // gradients of the accent -- so it must never be validated or sent.
+  readonly property var editableKeys: {
+    var keys = []
+    for (var i = 0; i < colorGroups.length; i++) {
+      for (var j = 0; j < colorGroups[i].keys.length; j++) keys.push(colorGroups[i].keys[j])
+    }
+    return keys
+  }
+
   // Index of the first editable row, so the list does not open on a header.
   readonly property int firstColorRow: {
     for (var i = 0; i < colorRows.length; i++) {
@@ -301,17 +312,18 @@ Item {
 
   function draftIsDirty() {
     if (!root.current) return false
-    for (var key in colorDraft) {
+    for (var i = 0; i < editableKeys.length; i++) {
+      var key = editableKeys[i]
       var typed = normaliseHex(colorDraft[key])
-      if (!typed) continue
-      if (typed !== String(root.current.colors[key] || "").toLowerCase()) return true
+      if (typed && typed !== String(root.current.colors[key] || "").toLowerCase()) return true
     }
     return false
   }
 
   function invalidColorKeys() {
     var bad = []
-    for (var key in colorDraft) {
+    for (var i = 0; i < editableKeys.length; i++) {
+      var key = editableKeys[i]
       if (draftFor(key) !== "" && !isHexValid(key)) bad.push(key)
     }
     return bad
@@ -353,7 +365,8 @@ Item {
       return
     }
     var argv = []
-    for (var key in colorDraft) {
+    for (var i = 0; i < editableKeys.length; i++) {
+      var key = editableKeys[i]
       var typed = normaliseHex(colorDraft[key])
       if (typed && typed !== String(root.current.colors[key] || "").toLowerCase())
         argv.push("--set-color", key + "=" + typed)
@@ -371,6 +384,14 @@ Item {
   function revertColors() {
     loadColorDraft()
     say("Reverted to the saved colours.")
+  }
+
+  // One place that switches panes, so the tab strip and the Ctrl+Tab shortcut
+  // cannot drift apart and every page gets the setup it needs on entry.
+  function showTab(index) {
+    stack.currentIndex = index
+    if (index === 1) loadCandidates()
+    if (index === 2) startColorEditing()
   }
 
   function generateTheme() {
@@ -671,6 +692,13 @@ Item {
 
       Keys.onEscapePressed: root.dismiss()
       Keys.onPressed: function(event) {
+        // Ctrl+Tab / Ctrl+Shift+Tab cycle the panes; the tab strip is otherwise
+        // mouse-only, which would strand anyone not using a pointer.
+        if (event.key === Qt.Key_Tab && (event.modifiers & Qt.ControlModifier)) {
+          var step = (event.modifiers & Qt.ShiftModifier) ? -1 : 1
+          root.showTab((stack.currentIndex + step + 3) % 3)
+          return
+        }
         // Browse-only shortcuts. The colour list handles its own arrows, and
         // yanking focus to the sidebar from there would strand the user.
         if (stack.currentIndex !== 0) return
@@ -1612,7 +1640,7 @@ Item {
                 MouseArea {
                   anchors.fill: parent
                   cursorShape: Qt.PointingHandCursor
-                  onClicked: stack.currentIndex = 0
+                  onClicked: root.showTab(0)
                 }
               }
               Text {
@@ -1623,10 +1651,7 @@ Item {
                 MouseArea {
                   anchors.fill: parent
                   cursorShape: Qt.PointingHandCursor
-                  onClicked: {
-                    stack.currentIndex = 1
-                    root.loadCandidates()
-                  }
+                  onClicked: root.showTab(1)
                 }
               }
               Text {
@@ -1637,10 +1662,7 @@ Item {
                 MouseArea {
                   anchors.fill: parent
                   cursorShape: Qt.PointingHandCursor
-                  onClicked: {
-                    stack.currentIndex = 2
-                    root.startColorEditing()
-                  }
+                  onClicked: root.showTab(2)
                 }
               }
             }
