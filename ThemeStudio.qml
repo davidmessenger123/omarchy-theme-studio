@@ -45,6 +45,8 @@ Item {
   // types into; colorGroups comes from the tool so the two never drift.
   property var colorGroups: []
   property var colorDraft: ({})
+  // Row index the keyboard has been handed to, or -1. See editColorCursor.
+  property int editingRow: -1
 
   // Group headers and colour keys flattened into one list, so a single repeater
   // can lay out both without a nested repeater losing hold of the outer model.
@@ -57,6 +59,14 @@ Item {
       }
     }
     return rows
+  }
+
+  // Index of the first editable row, so the list does not open on a header.
+  readonly property int firstColorRow: {
+    for (var i = 0; i < colorRows.length; i++) {
+      if (colorRows[i].kind === "color") return i
+    }
+    return 0
   }
 
   readonly property var current: selectedIndex >= 0 && selectedIndex < themes.length
@@ -311,6 +321,23 @@ Item {
     root.cancelRename()
     loadColorGroups()
     loadColorDraft()
+    // The list takes the keyboard so Up/Down and typing work straight away.
+    Qt.callLater(function() { colorList.forceActiveFocus() })
+  }
+
+  // Moves the highlight by `step`, stepping over group headers so Up and Down
+  // only ever land on something editable.
+  function moveColorCursor(step) {
+    var index = colorList.currentIndex
+    for (var i = index + step; i >= 0 && i < colorRows.length; i += step) {
+      if (colorRows[i].kind === "color") { colorList.currentIndex = i; return }
+    }
+  }
+
+  // Asks the highlighted row to take the keyboard. Routed through a property
+  // rather than itemAtIndex(), which hands back an untyped QQuickItem.
+  function editColorCursor() {
+    editingRow = colorList.currentIndex
   }
 
   function saveColors() {
@@ -384,6 +411,17 @@ Item {
 
   function dismiss() {
     opened = false
+    resetTransient()
+  }
+
+  // Dismissing the panel must not leave half-finished work behind: a rename
+  // field left open reappears with its stale text the next time it is shown.
+  function resetTransient() {
+    if (renameField) { renameField.text = "" }
+    renaming = false
+    renameText = ""
+    pendingFollowOld = ""
+    pendingFollowNew = ""
   }
 
   // Lifecycle hooks the shell calls on summon/hide.
@@ -393,12 +431,18 @@ Item {
       try { args = JSON.parse(payload) || {} } catch (e) { args = {} }
     }
     opened = true
+    resetTransient()
+    // The colour page is driven by the tool's group list. Fetch it on open as
+    // well as on tab switch, so the page is never blank because it was reached
+    // some other way.
+    if (colorGroups.length === 0) loadColorGroups()
     if (args.directory) { pickDir = String(args.directory); loadCandidates() }
     loadThemes()
   }
 
   function close() {
     opened = false
+    resetTransient()
   }
 
   // ----------------------------------------------------------------- plumbing
@@ -627,8 +671,17 @@ Item {
 
       Keys.onEscapePressed: root.dismiss()
       Keys.onPressed: function(event) {
+        // Browse-only shortcuts. The colour list handles its own arrows, and
+        // yanking focus to the sidebar from there would strand the user.
+        if (stack.currentIndex !== 0) return
         if (event.key === Qt.Key_Down) sidebarList.forceActiveFocus()
         if (event.key === Qt.Key_Tab) sidebarList.forceActiveFocus()
+        // R opens the rename field, so the whole of Browse is reachable without
+        // a mouse. Guarded on !renaming so it cannot fire while the field has
+        // focus and Enter is on its way to commitRename.
+        if (event.key === Qt.Key_R && !root.renaming
+            && root.current !== null && root.current.user)
+          root.startRename()
       }
 
       Rectangle {
@@ -1231,18 +1284,28 @@ Item {
 
             // --- edit an existing theme's colours
             Item {
-              visible: root.current !== null
-              enabled: root.current !== null
-
+              // No `visible` binding here or on the ColumnLayout below: those
+              // are StackLayout's own children, and binding visible on them
+              // would defeat the page switching. StackLayout does not manage
+              // the grandchildren, which is where the empty state belongs.
               ColumnLayout {
                 anchors.fill: parent
                 spacing: Style.space(10)
 
-                Text {
+                ColumnLayout {
                   visible: !root.current
-                  text: "Pick a theme to edit its colours"
-                  color: Color.muted
-                  font.pixelSize: Style.font.title
+                  Layout.alignment: Qt.AlignHCenter | Qt.AlignVCenter
+                  spacing: Style.space(8)
+                  Text {
+                    text: "Pick a theme to edit its colours"
+                    color: Color.muted
+                    font.pixelSize: Style.font.title
+                  }
+                  Text {
+                    text: "Colours are saved to colors.toml in the theme folder."
+                    color: Color.muted
+                    font.pixelSize: Style.font.body
+                  }
                 }
 
                 ColumnLayout {
@@ -1334,120 +1397,150 @@ Item {
                     }
                   }
 
-                  ScrollView {
+                  // A ListView rather than a Repeater in a ScrollView, so the
+                  // 29 fields are reachable with the arrow keys: the editor is
+                  // long and mouse-only navigation through it is tedious.
+                  ListView {
+                    id: colorList
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     clip: true
+                    model: root.colorRows
+                    // Groups are headers, not editable rows, so start on the
+                    // first one below a header rather than on a header itself.
+                    currentIndex: root.firstColorRow
+                    keyNavigationEnabled: false
+                    focus: true
                     ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
-                    ColumnLayout {
-                      width: parent.width
-                      spacing: Style.space(4)
+                    // Arrow keys are handled here rather than left to the
+                    // view's own key navigation, which would also stop on the
+                    // group headers between the fields.
+                    Keys.onUpPressed: root.moveColorCursor(-1)
+                    Keys.onDownPressed: root.moveColorCursor(1)
+                    Keys.onReturnPressed: root.editColorCursor()
+                    Keys.onPressed: function(event) {
+                      if (event.text && event.text.length === 1) root.editColorCursor()
+                    }
 
-                      Repeater {
-                        model: root.colorRows
+                    delegate: Item {
+                      id: colorRow
+                      required property var modelData
+                      required property int index
 
-                        delegate: Item {
-                          id: colorRow
-                          required property var modelData
+                      // True for exactly the one row the keyboard was asked to
+                      // edit; the rest ignore it.
+                      readonly property bool wantsFocus: root.editingRow === colorRow.index
+                      onWantsFocusChanged: if (wantsFocus) focusDelay.restart()
 
-                          readonly property bool isGroup: colorRow.modelData.kind === "group"
-                          readonly property string colorKey:
-                            colorRow.modelData.kind === "color" ? colorRow.modelData.key : ""
-                          readonly property string typed: root.draftFor(colorRow.colorKey)
-                          readonly property bool hasText: colorRow.typed !== ""
-                          readonly property bool valid: root.normaliseHex(colorRow.typed) !== ""
-                          readonly property string shown: colorRow.valid
-                            ? root.normaliseHex(colorRow.typed) : ""
+                      // Deferred a turn so the delegate exists and is on screen
+                      // before it is asked to take focus.
+                      Timer {
+                        id: focusDelay
+                        interval: 0
+                        onTriggered: {
+                          hexField.forceActiveFocus()
+                          hexField.selectAll()
+                        }
+                      }
 
-                          visible: colorRow.isGroup || colorRow.hasText
-                          Layout.fillWidth: true
-                          Layout.preferredHeight: colorRow.isGroup ? Style.space(28) : Style.space(30)
+                      readonly property bool isGroup: colorRow.modelData.kind === "group"
+                      readonly property string colorKey:
+                        colorRow.modelData.kind === "color" ? colorRow.modelData.key : ""
+                      readonly property string typed: root.draftFor(colorRow.colorKey)
+                      readonly property bool hasText: colorRow.typed !== ""
+                      readonly property bool valid: root.normaliseHex(colorRow.typed) !== ""
+                      readonly property string shown: colorRow.valid
+                        ? root.normaliseHex(colorRow.typed) : ""
 
-                          // Group header
-                          Text {
-                            visible: colorRow.isGroup
-                            anchors.left: parent.left
-                            anchors.bottom: parent.bottom
-                            anchors.bottomMargin: Style.space(2)
-                            text: colorRow.modelData.title
-                            color: Color.accent
-                            font.pixelSize: Style.font.caption
-                            font.weight: Font.Bold
-                            font.capitalization: Font.AllUppercase
+                      width: ListView.view.width
+                      height: colorRow.isGroup ? Style.space(28) : Style.space(30)
+
+                      // Group header
+                      Text {
+                        visible: colorRow.isGroup
+                        anchors.left: parent.left
+                        anchors.bottom: parent.bottom
+                        anchors.bottomMargin: Style.space(2)
+                        text: colorRow.modelData.title
+                        color: Color.accent
+                        font.pixelSize: Style.font.caption
+                        font.weight: Font.Bold
+                        font.capitalization: Font.AllUppercase
+                      }
+
+                      // Swatch
+                      Rectangle {
+                        visible: !colorRow.isGroup
+                        anchors.left: parent.left
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: Style.space(28)
+                        height: Style.space(22)
+                        radius: 3
+                        color: colorRow.shown !== "" ? colorRow.shown : "transparent"
+                        border.width: 1
+                        border.color: colorRow.hasText && !colorRow.valid
+                                      ? Color.urgent : root.borderColor
+                      }
+
+                      // Key name
+                      Text {
+                        visible: !colorRow.isGroup
+                        anchors.left: parent.left
+                        anchors.leftMargin: Style.space(34)
+                        anchors.right: hexBox.left
+                        anchors.rightMargin: Style.space(8)
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: colorRow.colorKey
+                        color: Color.muted
+                        font.pixelSize: Style.font.caption
+                        elide: Text.ElideRight
+                      }
+
+                      // Hex field
+                      Rectangle {
+                        id: hexBox
+                        visible: !colorRow.isGroup
+                        anchors.right: parent.right
+                        anchors.left: parent.left
+                        anchors.leftMargin: Style.space(180)
+                        anchors.verticalCenter: parent.verticalCenter
+                        height: Style.space(24)
+                        radius: 3
+                        color: Color.background.lighter(1.05)
+                        border.width: 1
+                        border.color: colorRow.hasText && !colorRow.valid
+                                      ? Color.urgent
+                                      : (colorList.currentIndex === colorRow.index
+                                         ? Color.accent : root.borderColor)
+
+                        TextInput {
+                          id: hexField
+                          anchors.fill: parent
+                          anchors.leftMargin: Style.space(8)
+                          anchors.rightMargin: Style.space(8)
+                          verticalAlignment: TextInput.AlignVCenter
+                          color: Color.foreground
+                          font.pixelSize: Style.font.caption
+                          font.family: "monospace"
+                          selectByMouse: true
+                          clip: true
+                          // onTextEdited fires only for real typing, so the
+                          // binding survives the user's own keystrokes while
+                          // still following an external reload.
+                          text: colorRow.typed
+                          onTextEdited: root.setDraft(colorRow.colorKey, text)
+                          // Escape abandons the edit and hands the keyboard
+                          // back to the list so the arrows work again.
+                          Keys.onEscapePressed: {
+                            root.revertColors()
+                            root.editingRow = -1
+                            colorList.forceActiveFocus()
                           }
-
-                          // Swatch
-                          Rectangle {
-                            visible: !colorRow.isGroup
-                            anchors.left: parent.left
-                            anchors.verticalCenter: parent.verticalCenter
-                            width: Style.space(28)
-                            height: Style.space(22)
-                            radius: 3
-                            color: colorRow.shown !== "" ? colorRow.shown : "transparent"
-                            border.width: 1
-                            border.color: colorRow.hasText && !colorRow.valid
-                                          ? Color.urgent : root.borderColor
-                          }
-
-                          // Key name
-                          Text {
-                            visible: !colorRow.isGroup
-                            anchors.left: parent.left
-                            anchors.leftMargin: Style.space(34)
-                            anchors.right: name.left
-                            anchors.rightMargin: Style.space(8)
-                            anchors.verticalCenter: parent.verticalCenter
-                            text: colorRow.colorKey
-                            color: Color.muted
-                            font.pixelSize: Style.font.caption
-                            elide: Text.ElideRight
-                          }
-
-                          Item {
-                            id: name
-                            visible: !colorRow.isGroup
-                            anchors.left: parent.left
-                            anchors.leftMargin: Style.space(150)
-                            width: 1
-                            height: 1
-                          }
-
-                          // Hex field
-                          Rectangle {
-                            visible: !colorRow.isGroup
-                            anchors.left: name.right
-                            anchors.leftMargin: Style.space(8)
-                            anchors.right: parent.right
-                            anchors.verticalCenter: parent.verticalCenter
-                            height: Style.space(24)
-                            radius: 3
-                            color: Color.background.lighter(1.05)
-                            border.width: 1
-                            border.color: colorRow.hasText && !colorRow.valid
-                                          ? Color.urgent
-                                          : (hexField.activeFocus ? Color.accent : root.borderColor)
-
-                            TextInput {
-                              id: hexField
-                              anchors.fill: parent
-                              anchors.leftMargin: Style.space(8)
-                              anchors.rightMargin: Style.space(8)
-                              verticalAlignment: TextInput.AlignVCenter
-                              color: Color.foreground
-                              font.pixelSize: Style.font.caption
-                              font.family: "monospace"
-                              selectByMouse: true
-                              clip: true
-                              // onTextEdited fires only for real typing, so the
-                              // binding survives the user's own keystrokes while
-                              // still following an external reload.
-                              text: colorRow.typed
-                              onTextEdited: root.setDraft(colorRow.colorKey, text)
-                              Keys.onReturnPressed: root.saveColors()
-                              Keys.onEscapePressed: root.revertColors()
-                            }
+                          Keys.onReturnPressed: {
+                            root.saveColors()
+                            root.editingRow = -1
+                            colorList.forceActiveFocus()
                           }
                         }
                       }
