@@ -9,7 +9,10 @@ import qs.Commons
 Item {
   id: root
 
-  readonly property string tool: Quickshell.env("HOME") + "/.local/bin/omarchy-theme-from-image"
+  // The CLI lives in the plugin directory so the whole studio is one git repo;
+  // ~/.local/bin/omarchy-theme-from-image is a symlink to it for command-line use.
+  readonly property string tool: Quickshell.env("HOME")
+                          + "/.config/omarchy/plugins/davidjm.theme-studio/omarchy-theme-from-image"
   readonly property string home: Quickshell.env("HOME")
   readonly property string userThemes: home + "/.config/omarchy/themes"
 
@@ -32,8 +35,29 @@ Item {
   // Set to a slug before reloading so the list can follow a row that changed
   // name, rather than resetting the selection to the active theme.
   property string pendingFollowOld: ""
+  // The slug the old one became. Held separately because closing the rename
+  // field clears renameText, which the list reload no longer has.
+  property string pendingFollowNew: ""
   property bool renaming: false
   property string renameText: ""
+
+  // "Edit colours" workspace state. colorDraft is the working copy the user
+  // types into; colorGroups comes from the tool so the two never drift.
+  property var colorGroups: []
+  property var colorDraft: ({})
+
+  // Group headers and colour keys flattened into one list, so a single repeater
+  // can lay out both without a nested repeater losing hold of the outer model.
+  readonly property var colorRows: {
+    var rows = []
+    for (var i = 0; i < colorGroups.length; i++) {
+      rows.push({ kind: "group", title: colorGroups[i].title })
+      for (var j = 0; j < colorGroups[i].keys.length; j++) {
+        rows.push({ kind: "color", key: colorGroups[i].keys[j] })
+      }
+    }
+    return rows
+  }
 
   readonly property var current: selectedIndex >= 0 && selectedIndex < themes.length
                                 ? themes[selectedIndex]
@@ -74,18 +98,17 @@ Item {
   function onThemesReady() {
     // After a rename the old slug is gone; keep the selection on the new name.
     if (pendingFollowOld !== "") {
-      for (var i = 0; i < themes.length; i++) {
-        if (themes[i].slug !== pendingFollowOld) continue
-        var renamedFrom = renameText.trim()
-        for (var j = 0; j < themes.length; j++) {
-          if (slugOf(renamedFrom) === themes[j].slug) {
-            pendingFollowOld = ""
-            selectedIndex = j
-            return
-          }
+      for (var j = 0; j < themes.length; j++) {
+        if (pendingFollowNew === themes[j].slug) {
+          var keep = j
+          pendingFollowOld = ""
+          pendingFollowNew = ""
+          selectedIndex = keep
+          return
         }
       }
       pendingFollowOld = ""
+      pendingFollowNew = ""
     }
     var activeAt = -1
     for (var k = 0; k < themes.length; k++) {
@@ -93,6 +116,16 @@ Item {
     }
     if (selectedIndex < 0 || selectedIndex >= themes.length)
       selectedIndex = activeAt >= 0 ? activeAt : 0
+
+    // The colours on disk are the truth; drop any draft left over from before
+    // the reload, or it would show values that no longer match the theme.
+    if (stack.currentIndex === 2) loadColorDraft()
+  }
+
+  // Switching rows while editing colours shows that row's palette, not the
+  // previous theme's.
+  onSelectedIndexChanged: {
+    if (stack.currentIndex === 2) loadColorDraft()
   }
 
   // Mirrors the tool's slugify so the list can predict the new directory name.
@@ -162,28 +195,155 @@ Item {
 
   function startRename() {
     if (!root.current || !root.current.user) return
-    renameText = root.current.slug
     renaming = true
+    // Seed the field directly rather than through a binding: the user's typing
+    // would otherwise break the binding and leave renameText stale.
+    renameText = root.current.slug
+    renameField.text = renameText
     Qt.callLater(function() { renameField.forceActiveFocus(); renameField.selectAll() })
   }
 
   function cancelRename() {
     renaming = false
     renameText = ""
+    renameField.text = ""
+  }
+
+  // What the name will actually become on disk, and why it cannot, so the hint
+  // can say so before Enter is pressed rather than after a failed rename.
+  readonly property string renameSlug: slugOf(renameText)
+  readonly property string renameProblem: {
+    if (!renaming) return ""
+    var typed = String(renameText || "").trim()
+    if (!typed) return "Type a name."
+    if (!renameSlug) return "That has no letters or digits in it."
+    if (renameSlug === selectedTheme()) return "That is the current name."
+    for (var i = 0; i < themes.length; i++) {
+      if (themes[i].slug === renameSlug) return "'" + renameSlug + "' is taken."
+    }
+    return ""
   }
 
   function commitRename() {
     var slug = selectedTheme()
-    var wanted = String(renameText || "").trim()
-    if (renaming && slug && wanted && wanted !== slug) {
-      say("Renaming " + slug + " to " + wanted + "...")
+    var wanted = String(renameField.text || "").trim()
+    if (root.renameProblem !== "") {
+      say(root.renameProblem, true)
+      return
+    }
+    if (renaming && slug && wanted) {
+      say("Renaming " + slug + " to " + root.renameSlug + "...")
       renameProc.oldSlug = slug
+      pendingFollowOld = slug
+      pendingFollowNew = root.renameSlug
       renameProc.command = ["/usr/bin/python3", "-I", root.tool,
                             "--rename", slug, "--to", wanted]
       renameProc.running = true
     } else {
       cancelRename()
     }
+  }
+
+  // ------------------------------------------------------------ colour editing
+
+  function loadColorGroups() {
+    if (groupsProc.running) return
+    groupsProc.running = true
+  }
+
+  // The draft mirrors the selected theme's colors.toml, so Save only has to
+  // send what actually changed.
+  function loadColorDraft() {
+    var draft = {}
+    if (root.current) {
+      var saved = root.current.colors
+      for (var key in saved) draft[key] = saved[key]
+    }
+    colorDraft = draft
+  }
+
+  function draftFor(key) {
+    var value = colorDraft[key]
+    return typeof value === "string" ? value : ""
+  }
+
+  // Reassigns the whole object so every field's text binding re-evaluates.
+  function setDraft(key, value) {
+    var next = {}
+    for (var existing in colorDraft) next[existing] = colorDraft[existing]
+    next[key] = value
+    colorDraft = next
+  }
+
+  // Accepts what a person actually types -- "f0a", "#F0A", "f0a1b2" -- and
+  // returns a normalised #rrggbb, or "" when it cannot be one.
+  function normaliseHex(value) {
+    var text = String(value || "").trim().replace(/^#/, "").toLowerCase()
+    if (/^[0-9a-f]{3}$/.test(text)) {
+      text = text[0] + text[0] + text[1] + text[1] + text[2] + text[2]
+    }
+    return /^[0-9a-f]{6}$/.test(text) ? "#" + text : ""
+  }
+
+  function isHexValid(key) {
+    return normaliseHex(draftFor(key)) !== ""
+  }
+
+  function draftIsDirty() {
+    if (!root.current) return false
+    for (var key in colorDraft) {
+      var typed = normaliseHex(colorDraft[key])
+      if (!typed) continue
+      if (typed !== String(root.current.colors[key] || "").toLowerCase()) return true
+    }
+    return false
+  }
+
+  function invalidColorKeys() {
+    var bad = []
+    for (var key in colorDraft) {
+      if (draftFor(key) !== "" && !isHexValid(key)) bad.push(key)
+    }
+    return bad
+  }
+
+  function startColorEditing() {
+    root.cancelRename()
+    loadColorGroups()
+    loadColorDraft()
+  }
+
+  function saveColors() {
+    var slug = selectedTheme()
+    if (!slug) return
+    if (!root.current.user) {
+      say("Stock themes cannot be edited.", true)
+      return
+    }
+    var bad = invalidColorKeys()
+    if (bad.length) {
+      say("Not a hex colour: " + bad.join(", "), true)
+      return
+    }
+    var argv = []
+    for (var key in colorDraft) {
+      var typed = normaliseHex(colorDraft[key])
+      if (typed && typed !== String(root.current.colors[key] || "").toLowerCase())
+        argv.push("--set-color", key + "=" + typed)
+    }
+    if (argv.length === 0) {
+      say("Nothing changed.")
+      return
+    }
+    say("Saving colours to " + slug + "...")
+    saveColorsProc.command = ["/usr/bin/python3", "-I", root.tool,
+                              "--name", slug, "--refresh"].concat(argv)
+    saveColorsProc.running = true
+  }
+
+  function revertColors() {
+    loadColorDraft()
+    say("Reverted to the saved colours.")
   }
 
   function generateTheme() {
@@ -339,10 +499,42 @@ Item {
       onStreamFinished: root.say(String(text || "").trim(), true)
     }
     onExited: {
-      if (root.statusIsError) return
-      var note = root.status
+      if (root.statusIsError) {
+        // The row is still under its old name; let the user try again.
+        pendingFollowOld = ""
+        pendingFollowNew = ""
+        return
+      }
       root.cancelRename()
-      root.pendingFollowOld = renameProc.oldSlug
+      root.loadThemes()
+    }
+    command: []
+  }
+
+  Process {
+    id: groupsProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.colorGroups = root.parse(text)
+    }
+    command: ["/usr/bin/python3", "-I", root.tool, "--groups"]
+  }
+
+  Process {
+    id: saveColorsProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var lines = String(text || "").trim().split("\n").filter(function(l) { return l !== "" })
+        if (lines.length) root.say(lines.join(" "))
+      }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.say(String(text || "").trim(), true)
+    }
+    onExited: {
+      if (root.statusIsError) return
       root.loadThemes()
     }
     command: []
@@ -826,6 +1018,7 @@ Item {
                     font.pixelSize: Style.font.body
                     selectByMouse: true
                     clip: true
+                    onTextChanged: root.renameText = text
                     Keys.onReturnPressed: root.commitRename()
                     Keys.onEnterPressed: root.commitRename()
                     Keys.onEscapePressed: root.cancelRename()
@@ -848,6 +1041,7 @@ Item {
 
                   ActionButton {
                     label: "Save Name"
+                    enabled: root.renameProblem === ""
                     busy: renameProc.running
                     onClicked: root.commitRename()
                   }
@@ -858,8 +1052,12 @@ Item {
                   }
                   Item { Layout.fillWidth: true }
                   Text {
-                    text: "Letters, digits and dashes. Backgrounds come along."
-                    color: Color.muted
+                    text: root.renameProblem !== ""
+                          ? root.renameProblem
+                          : (root.renameSlug !== ""
+                             ? "Becomes " + root.renameSlug + "  ·  backgrounds come along"
+                             : "Letters, digits and dashes. Backgrounds come along.")
+                    color: root.renameProblem !== "" ? Color.urgent : Color.muted
                     font.pixelSize: Style.font.caption
                   }
                 }
@@ -1030,6 +1228,247 @@ Item {
                 }
               }
             }
+
+            // --- edit an existing theme's colours
+            Item {
+              visible: root.current !== null
+              enabled: root.current !== null
+
+              ColumnLayout {
+                anchors.fill: parent
+                spacing: Style.space(10)
+
+                Text {
+                  visible: !root.current
+                  text: "Pick a theme to edit its colours"
+                  color: Color.muted
+                  font.pixelSize: Style.font.title
+                }
+
+                ColumnLayout {
+                  visible: root.current !== null
+                  Layout.fillWidth: true
+                  Layout.fillHeight: true
+                  spacing: Style.space(10)
+
+                  RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Style.space(10)
+                    Text {
+                      text: "Colours"
+                      color: Color.foreground
+                      font.pixelSize: Style.font.title
+                      font.weight: Font.Bold
+                    }
+                    Text {
+                      text: root.current ? root.current.slug : ""
+                      color: Color.muted
+                      font.pixelSize: Style.font.caption
+                    }
+                    Item { Layout.fillWidth: true }
+                    ActionButton {
+                      label: "Revert"
+                      enabled: root.current !== null && root.draftIsDirty()
+                      onClicked: root.revertColors()
+                    }
+                    ActionButton {
+                      label: "Save Changes"
+                      enabled: root.current !== null && root.current.user
+                                 && root.draftIsDirty()
+                      busy: saveColorsProc.running
+                      onClicked: root.saveColors()
+                    }
+                  }
+
+                  // Live preview of the theme as typed, so a bad pick is obvious
+                  // before saving rather than after.
+                  Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: Style.space(64)
+                    radius: Style.cornerRadius
+                    color: root.normaliseHex(root.draftFor("background")) || Color.background
+                    border.width: 1
+                    border.color: root.borderColor
+
+                    RowLayout {
+                      anchors.fill: parent
+                      anchors.margins: Style.space(10)
+                      spacing: Style.space(10)
+
+                      Text {
+                        Layout.fillWidth: true
+                        text: "Aa  The quick brown fox"
+                        color: root.normaliseHex(root.draftFor("foreground")) || Color.foreground
+                        font.pixelSize: Style.font.title
+                        elide: Text.ElideRight
+                      }
+                      Rectangle {
+                        implicitWidth: swatchLabel.implicitWidth + Style.space(16)
+                        implicitHeight: swatchLabel.implicitHeight + Style.space(8)
+                        radius: Style.cornerRadius
+                        color: root.normaliseHex(root.draftFor("accent")) || Color.accent
+                        Text {
+                          id: swatchLabel
+                          anchors.centerIn: parent
+                          text: "accent"
+                          color: root.normaliseHex(root.draftFor("background")) || Color.background
+                          font.pixelSize: Style.font.caption
+                          font.weight: Font.DemiBold
+                        }
+                      }
+                      Rectangle {
+                        implicitWidth: mutedLabel.implicitWidth + Style.space(16)
+                        implicitHeight: mutedLabel.implicitHeight + Style.space(8)
+                        radius: Style.cornerRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: root.normaliseHex(root.draftFor("muted")) || Color.muted
+                        Text {
+                          id: mutedLabel
+                          anchors.centerIn: parent
+                          text: "muted"
+                          color: root.normaliseHex(root.draftFor("muted")) || Color.muted
+                          font.pixelSize: Style.font.caption
+                        }
+                      }
+                    }
+                  }
+
+                  ScrollView {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    clip: true
+                    ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+                    ColumnLayout {
+                      width: parent.width
+                      spacing: Style.space(4)
+
+                      Repeater {
+                        model: root.colorRows
+
+                        delegate: Item {
+                          id: colorRow
+                          required property var modelData
+
+                          readonly property bool isGroup: colorRow.modelData.kind === "group"
+                          readonly property string colorKey:
+                            colorRow.modelData.kind === "color" ? colorRow.modelData.key : ""
+                          readonly property string typed: root.draftFor(colorRow.colorKey)
+                          readonly property bool hasText: colorRow.typed !== ""
+                          readonly property bool valid: root.normaliseHex(colorRow.typed) !== ""
+                          readonly property string shown: colorRow.valid
+                            ? root.normaliseHex(colorRow.typed) : ""
+
+                          visible: colorRow.isGroup || colorRow.hasText
+                          Layout.fillWidth: true
+                          Layout.preferredHeight: colorRow.isGroup ? Style.space(28) : Style.space(30)
+
+                          // Group header
+                          Text {
+                            visible: colorRow.isGroup
+                            anchors.left: parent.left
+                            anchors.bottom: parent.bottom
+                            anchors.bottomMargin: Style.space(2)
+                            text: colorRow.modelData.title
+                            color: Color.accent
+                            font.pixelSize: Style.font.caption
+                            font.weight: Font.Bold
+                            font.capitalization: Font.AllUppercase
+                          }
+
+                          // Swatch
+                          Rectangle {
+                            visible: !colorRow.isGroup
+                            anchors.left: parent.left
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: Style.space(28)
+                            height: Style.space(22)
+                            radius: 3
+                            color: colorRow.shown !== "" ? colorRow.shown : "transparent"
+                            border.width: 1
+                            border.color: colorRow.hasText && !colorRow.valid
+                                          ? Color.urgent : root.borderColor
+                          }
+
+                          // Key name
+                          Text {
+                            visible: !colorRow.isGroup
+                            anchors.left: parent.left
+                            anchors.leftMargin: Style.space(34)
+                            anchors.right: name.left
+                            anchors.rightMargin: Style.space(8)
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: colorRow.colorKey
+                            color: Color.muted
+                            font.pixelSize: Style.font.caption
+                            elide: Text.ElideRight
+                          }
+
+                          Item {
+                            id: name
+                            visible: !colorRow.isGroup
+                            anchors.left: parent.left
+                            anchors.leftMargin: Style.space(150)
+                            width: 1
+                            height: 1
+                          }
+
+                          // Hex field
+                          Rectangle {
+                            visible: !colorRow.isGroup
+                            anchors.left: name.right
+                            anchors.leftMargin: Style.space(8)
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            height: Style.space(24)
+                            radius: 3
+                            color: Color.background.lighter(1.05)
+                            border.width: 1
+                            border.color: colorRow.hasText && !colorRow.valid
+                                          ? Color.urgent
+                                          : (hexField.activeFocus ? Color.accent : root.borderColor)
+
+                            TextInput {
+                              id: hexField
+                              anchors.fill: parent
+                              anchors.leftMargin: Style.space(8)
+                              anchors.rightMargin: Style.space(8)
+                              verticalAlignment: TextInput.AlignVCenter
+                              color: Color.foreground
+                              font.pixelSize: Style.font.caption
+                              font.family: "monospace"
+                              selectByMouse: true
+                              clip: true
+                              // onTextEdited fires only for real typing, so the
+                              // binding survives the user's own keystrokes while
+                              // still following an external reload.
+                              text: colorRow.typed
+                              onTextEdited: root.setDraft(colorRow.colorKey, text)
+                              Keys.onReturnPressed: root.saveColors()
+                              Keys.onEscapePressed: root.revertColors()
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+
+                  Text {
+                    Layout.fillWidth: true
+                    visible: root.current !== null
+                    text: root.current.user
+                          ? (root.draftIsDirty()
+                             ? "Unsaved changes. Saving re-applies the theme; the wallpaper does not change."
+                             : "Saved colours. Editing the accent redraws the Hyprland border gradient.")
+                          : "Stock theme — pick one of your own to edit it."
+                    color: root.draftIsDirty() ? Color.accent : Color.muted
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                  }
+                }
+              }
+            }
           }
         }
 
@@ -1094,6 +1533,20 @@ Item {
                   onClicked: {
                     stack.currentIndex = 1
                     root.loadCandidates()
+                  }
+                }
+              }
+              Text {
+                text: "Colours"
+                color: stack.currentIndex === 2 ? Color.accent : Color.muted
+                font.pixelSize: Style.font.caption
+                font.weight: Font.DemiBold
+                MouseArea {
+                  anchors.fill: parent
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    stack.currentIndex = 2
+                    root.startColorEditing()
                   }
                 }
               }

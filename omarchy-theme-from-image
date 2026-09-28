@@ -320,19 +320,30 @@ ORDER = [
 ]
 
 
+def border_values(accent):
+    """The two Hyprland border tokens derived from an accent colour.
+
+    The active border is a two-stop gradient, the second stop rotated off the
+    accent so it reads as a gradient rather than a flat outline.
+    """
+    base = accent.lstrip("#")
+    hue, saturation, lightness = rgb_to_hsl(*hex_to_rgb(accent))
+    second = to_hex(hue + 38.0, saturation, min(1.0, lightness + 0.08)).lstrip("#")
+    return {
+        "hyprland_active_border": f"rgba({base}ee) rgba({second}ee) 45deg",
+        "hyprland_inactive_border": f"rgba({base}44)",
+    }
+
+
 def render_colors_toml(colours, dark):
     accent = colours["accent"].lstrip("#")
     lines = [f'mode = "{"dark" if dark else "light"}"', ""]
     for key in ORDER:
-        if key in ("mode", "hyprland_active_border", "hyprland_inactive_border"):
+        if key in ("mode", *DERIVED_KEYS):
             continue
         lines.append(f'{key} = "{colours[key]}"')
-    # The border is a two-stop gradient, the second stop rotated off the accent
-    # so the active border reads as a gradient rather than a flat outline.
-    hue, saturation, lightness = rgb_to_hsl(*hex_to_rgb(colours["accent"]))
-    second = to_hex(hue + 38.0, saturation, min(1.0, lightness + 0.08)).lstrip("#")
-    lines.append(f'hyprland_active_border = "rgba({accent}ee) rgba({second}ee) 45deg"')
-    lines.append(f'hyprland_inactive_border = "rgba({accent}44)"')
+    for key, value in border_values(colours["accent"]).items():
+        lines.append(f'{key} = "{value}"')
     return "\n".join(lines) + "\n"
 
 
@@ -345,6 +356,115 @@ def slugify(name):
     if not slug or slug.startswith("."):
         raise ThemeError(f"{name!r} does not make a usable theme name")
     return slug
+
+
+# ------------------------------------------------------------------ colour edits
+
+# The two Hyprland border tokens are a two-stop gradient derived from the accent
+# (see render_colors_toml), so they are not hand-editable: moving the accent has
+# to carry them along rather than leave a stale gradient behind.
+DERIVED_KEYS = ("hyprland_active_border", "hyprland_inactive_border")
+EDITABLE_KEYS = tuple(key for key in ORDER if key != "mode" and key not in DERIVED_KEYS)
+
+# Grouped for the editor UI; order is the order the groups are shown.
+EDIT_GROUPS = (
+    ("Surfaces", ("background", "dark_background", "darker_background",
+                 "lighter_background")),
+    ("Text", ("foreground", "bright_foreground", "light_foreground",
+              "dark_foreground", "muted")),
+    ("Accent", ("accent", "selection")),
+    ("ANSI", ("red", "orange", "yellow", "green", "cyan", "blue", "magenta", "brown")),
+    ("Bright ANSI", ("bright_red", "bright_orange", "bright_yellow", "bright_green",
+                     "bright_cyan", "bright_blue", "bright_magenta")),
+)
+# bright_orange is not generated, so it is not offered even though the group name
+# reads as a set. Drop it rather than offer a key that is never written.
+EDIT_GROUPS = tuple(
+    (title, tuple(key for key in keys if key in EDITABLE_KEYS))
+    for title, keys in EDIT_GROUPS
+)
+
+
+def normalise_hex(key, value):
+    """Validate one edited colour and return it as #rrggbb, or raise."""
+    text = str(value or "").strip()
+    if not text.startswith("#"):
+        text = "#" + text
+    body = text[1:]
+    if not re.fullmatch(r"[0-9A-Fa-f]{6}", body):
+        raise ThemeError(f"{key} needs a hex colour like #1a2b3c, not {value!r}")
+    return "#" + body.lower()
+
+
+def edit_colors(slug, updates, rederive_borders=True):
+    """Rewrite individual colour keys in a generated theme's colors.toml.
+
+    Everything the tool did not write -- comments, key order, and the mode
+    flag -- is preserved, so a hand-tuned file survives an edit. Returns the
+    number of keys changed.
+    """
+    target = USER_THEMES / slug
+    path = target / "colors.toml"
+    if not path.is_file():
+        raise ThemeError(f"no generated theme called '{slug}' to edit")
+
+    wanted = {}
+    for item in updates:
+        key, separator, value = str(item).partition("=")
+        if not separator:
+            raise ThemeError(f"expected key=value, not {item!r}")
+        key = key.strip()
+        if key in DERIVED_KEYS:
+            raise ThemeError(f"{key} follows the accent and is not edited directly")
+        if key not in EDITABLE_KEYS:
+            raise ThemeError(f"{key} is not a theme colour")
+        wanted[key] = normalise_hex(key, value)
+    if not wanted:
+        raise ThemeError("no colours given to set")
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    changed, replaced = 0, set()
+    for index, line in enumerate(lines):
+        match = re.match(r"^(\s*)([A-Za-z0-9_-]+)(\s*=\s*)(.*?)(\s*)$", line)
+        if not match:
+            continue
+        indent, key, equals, _, trailing = match.groups()
+        if key not in wanted or key in replaced:
+            continue
+        if unquote(equals + _ + trailing) == wanted[key]:
+            continue
+        lines[index] = f'{indent}{key}{equals}"{wanted[key]}"{trailing}'
+        replaced.add(key)
+        changed += 1
+
+    missing = [key for key in wanted if key not in replaced]
+    for key in missing:
+        lines.append(f'{key} = "{wanted[key]}"')
+    changed += len(missing)
+
+    if rederive_borders and "accent" in replaced:
+        for key, value in border_values(wanted["accent"]).items():
+            set_toml_key(lines, key, value)
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return changed
+
+
+def unquote(value):
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def set_toml_key(lines, key, value):
+    """Replace key's value in-place, or append it, ignoring inline comments."""
+    pattern = re.compile(rf"^(\s*{re.escape(key)}\s*=\s*)(.*?)(\s*)$")
+    for index, line in enumerate(lines):
+        if pattern.match(line):
+            lines[index] = f'{pattern.match(line).group(1)}"{value}"'
+            return
+    lines.append(f'{key} = "{value}"')
 
 
 def default_name(image):
@@ -554,6 +674,22 @@ def apply_theme(slug):
         raise ThemeError(detail[-1] if detail else "omarchy theme set failed")
 
 
+def refresh_theme(slug):
+    """Re-run theme set without touching the wallpaper.
+
+    omarchy-theme-set honours OMARCHY_THEME_SKIP_BACKGROUND to apply just the
+    colours, which is what a colour edit wants: the bar and menus repaint but
+    the background does not jump to the next image in the set.
+    """
+    if shutil.which("omarchy") is None:
+        raise ThemeError("omarchy is not on PATH, so the theme was not re-applied")
+    environment = dict(os.environ, OMARCHY_THEME_SKIP_BACKGROUND="1")
+    result = run(["omarchy", "theme", "set", slug], env=environment)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        raise ThemeError(detail[-1] if detail else "omarchy theme set failed")
+
+
 def rename_theme(old, new):
     """Move a generated theme to a new slug, keeping its backgrounds."""
     source = USER_THEMES / old
@@ -635,6 +771,15 @@ def main():
                         help="with --to, rename a generated theme and its backgrounds")
     parser.add_argument("--to", metavar="NEW",
                         help="new theme name for --rename")
+    parser.add_argument("--set-color", metavar="KEY=VALUE", action="append", default=[],
+                        dest="set_color",
+                        help="set one colour in an existing theme; repeatable. "
+                             "Editing the accent re-derives the Hyprland borders")
+    parser.add_argument("--refresh", action="store_true",
+                        help="with --set-color, re-apply the theme so the change is "
+                             "seen at once, without cycling the wallpaper")
+    parser.add_argument("--groups", action="store_true",
+                        help="print the editable colour groups as JSON, then exit")
     parser.add_argument("--list", action="store_true",
                         help="print every theme and its backgrounds as JSON, then exit")
     parser.add_argument("--images-in", metavar="DIR",
@@ -653,6 +798,19 @@ def main():
             return 0
         if arguments.images_in:
             emit(list_background_files(Path(arguments.images_in).expanduser()))
+            return 0
+        if arguments.groups:
+            emit([{"title": title, "keys": list(keys)} for title, keys in EDIT_GROUPS])
+            return 0
+        if arguments.set_color:
+            if arguments.name is None:
+                raise ThemeError("--set-color needs the theme name to edit")
+            slug = slugify(arguments.name)
+            changed = edit_colors(slug, arguments.set_color)
+            print(f"Updated {changed} colour(s) in '{slug}'.")
+            if arguments.refresh:
+                refresh_theme(slug)
+                print(f"Re-applied '{slug}'; the bar and menus picked it up.")
             return 0
         if arguments.rename or arguments.to:
             if not (arguments.rename and arguments.to):
