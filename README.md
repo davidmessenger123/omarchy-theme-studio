@@ -7,6 +7,65 @@ afterwards.
 
 Also on the launcher menu as **Theme Studio**.
 
+## Install
+
+```sh
+git clone https://github.com/davidmessenger123/omarchy-theme-studio.git \
+  ~/.config/omarchy/plugins/davidjm.theme-studio
+ln -s ~/.config/omarchy/plugins/davidjm.theme-studio/omarchy-theme-from-image \
+  ~/.local/bin/omarchy-theme-from-image
+omarchy plugin enable davidjm.theme-studio
+```
+
+The clone path is not optional: the plugin finds its CLI at
+`~/.config/omarchy/plugins/davidjm.theme-studio/omarchy-theme-from-image`, so
+the symlink has to point there for both the plugin and the command line to
+work. `omarchy plugin enable` registers it in `shell.json`; saving a file under
+`~/.config/omarchy/plugins/` reloads the plugin, so the shell does not need
+restarting.
+
+To uninstall, remove the directory and `omarchy plugin remove
+davidjm.theme-studio`.
+
+### Optional: a launcher menu entry
+
+```sh
+omarchy-menu-edit   # or edit ~/.config/omarchy/extensions/omarchy-menu.jsonc
+```
+
+Add, under `menu`:
+
+```jsonc
+"style.theme-studio": {
+  "icon": "",
+  "label": "Theme Studio",
+  "description": "Generate and manage themes from wallpapers",
+  "aliases": ["theme-studio", "theme-from-image"],
+  "action": "omarchy-shell shell summon davidjm.theme-studio"
+}
+```
+
+## Requirements
+
+- [Omarchy](https://omarchy.org) with the shell runtime.
+- Python 3 (stdlib only) and ImageMagick (`magick`) for the CLI.
+
+### If you want your themes in git
+
+Omarchy treats a theme directory that contains its own `.git` as third-party
+content. A theme is only checked for `<theme>/.git`, so a repository at the
+`themes/` level is fine and each theme is still treated as yours:
+
+```sh
+git -C ~/.config/omarchy/themes init
+```
+
+Do not run `git init` inside an individual `~/.config/omarchy/themes/<name>/`.
+That switches the theme to the restricted staging path, which skips symlinks
+and ignores `*.lua`, `alacritty.toml`, `foot.ini`, `ghostty.conf`, `kitty.conf`
+and `vscode.json` — so a hand-added Neovim or terminal config would silently
+stop being applied. Backgrounds and `colors.toml` are unaffected.
+
 ## Layout
 
 Three panes, cycled with <kbd>Ctrl</kbd>+<kbd>Tab</kbd> (and the tab strip):
