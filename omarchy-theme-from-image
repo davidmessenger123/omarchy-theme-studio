@@ -386,7 +386,12 @@ EDIT_GROUPS = tuple(
 
 
 def normalise_hex(key, value):
-    """Validate one edited colour and return it as #rrggbb, or raise."""
+    """Validate one edited colour and return it as #rrggbb, or raise.
+
+    Strictly six digits. The studio expands the #f0a shorthand itself, because
+    it has to show the swatch as you type, and sends the expanded form; this is
+    the authority that the result is a real colour.
+    """
     text = str(value or "").strip()
     if not text.startswith("#"):
         text = "#" + text
@@ -423,21 +428,28 @@ def edit_colors(slug, updates, rederive_borders=True):
         raise ThemeError("no colours given to set")
 
     lines = path.read_text(encoding="utf-8").splitlines()
-    changed, replaced = 0, set()
+    changed, replaced, present = 0, set(), set()
     for index, line in enumerate(lines):
         match = re.match(r"^(\s*)([A-Za-z0-9_-]+)(\s*=\s*)(.*?)(\s*)$", line)
         if not match:
             continue
-        indent, key, equals, _, trailing = match.groups()
-        if key not in wanted or key in replaced:
+        indent, key, equals, value, trailing = match.groups()
+        if key not in wanted or key in present:
             continue
-        if unquote(equals + _ + trailing) == wanted[key]:
+        # `present` records that the key was found, whether or not it needed
+        # rewriting. Only `replaced` means the value moved; a key that is
+        # already correct must not fall through to the append below, or every
+        # no-op save would add another copy of the same line.
+        present.add(key)
+        # Compare the value alone. Reassembling the whole right-hand side
+        # would include the `= ` separator and never match.
+        if unquote(value).lower() == wanted[key]:
             continue
         lines[index] = f'{indent}{key}{equals}"{wanted[key]}"{trailing}'
         replaced.add(key)
         changed += 1
 
-    missing = [key for key in wanted if key not in replaced]
+    missing = [key for key in wanted if key not in present]
     for key in missing:
         lines.append(f'{key} = "{wanted[key]}"')
     changed += len(missing)
@@ -486,9 +498,9 @@ def read_colors(path):
                 continue
             key, _, value = line.partition("=")
             key = key.strip()
-            value = value.strip()
-            if value.startswith('"') and value.endswith('"') and len(value) >= 2:
-                value = value[1:-1]
+            # Either quote style: the shell's own parser accepts both, so a
+            # hand-edited theme using '' must still be readable here.
+            value = unquote(value.strip())
             if key:
                 colours[key] = value
     except OSError:

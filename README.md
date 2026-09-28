@@ -130,3 +130,24 @@ is unchanged.
 
 `--preview` prints the palette without writing anything. ImageMagick does the
 pixel work; everything after that is stdlib Python.
+
+## Tests
+
+```sh
+python3 -m unittest discover -s tests
+```
+
+Covers the pure logic: colour maths, the contrast floor, slug rules, hex
+validation, and the `colors.toml` rewrite. The palette tests need ImageMagick
+and are skipped without it. CI runs these on every push.
+
+QML is not linted in CI — see the comment at the top of `test.yml`. Locally:
+
+```sh
+/usr/lib/qt6/bin/qmllint -I /usr/share/omarchy/shell ThemeStudio.qml
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
