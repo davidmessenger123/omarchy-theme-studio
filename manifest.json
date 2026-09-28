@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "davidjm.theme-studio",
+  "name": "Theme Studio",
+  "version": "1.0.0",
+  "author": "David JM",
+  "license": "MIT",
+  "description": "Generate Omarchy themes from wallpapers, browse the palette, manage a theme's backgrounds, and remove themes. Summon with: omarchy-shell shell summon davidjm.theme-studio '{}'",
+  "kinds": [
+    "overlay"
+  ],
+  "entryPoints": {
+    "overlay": "ThemeStudio.qml"
+  }
+}

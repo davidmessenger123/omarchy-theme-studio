@@ -1,0 +1,751 @@
+#!/usr/bin/python3
+"""Generate an Omarchy theme from a wallpaper.
+
+Reads the dominant colours out of an image, derives a full colors.toml, writes a
+theme under ~/.config/omarchy/themes/<slug>/ with the wallpaper alongside it, and
+applies it with `omarchy theme set`.
+
+ImageMagick does the pixel work; everything after that is stdlib Python.
+"""
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+USER_THEMES = Path.home() / ".config" / "omarchy" / "themes"
+# Exactly the extensions omarchy-theme-set passes to `find` when it picks a
+# theme background. Anything else ImageMagick can read is still fine as a
+# source, but it has to be converted before it is stored, or the theme applies
+# with no background at all.
+OMARCHY_BACKGROUND_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "gif"}
+CHOOSER_EXTENSIONS = "png jpg jpeg webp bmp gif avif jxl heic tif tiff"
+
+# Target hue (degrees) and usable lightness/saturation window for each ANSI slot.
+# The window keeps a match usable as terminal text; a wallpaper's own shade of a
+# colour is often too dark or too washed out to read against the background.
+SLOTS = {
+    "red": (0.0, 0.52, 0.62, 0.30),
+    "orange": (28.0, 0.60, 0.70, 0.55),
+    "yellow": (52.0, 0.62, 0.74, 0.55),
+    "green": (135.0, 0.48, 0.60, 0.32),
+    "cyan": (188.0, 0.52, 0.60, 0.32),
+    "blue": (228.0, 0.55, 0.62, 0.35),
+    "magenta": (305.0, 0.52, 0.62, 0.35),
+    "brown": (25.0, 0.38, 0.42, 0.40),
+}
+BRIGHT_SLOTS = ("red", "yellow", "green", "cyan", "blue", "magenta")
+# Hue distance past which a candidate is a different colour rather than a shade.
+HUE_TOLERANCE = 32.0
+
+
+class ThemeError(Exception):
+    pass
+
+
+def run(command, **kwargs):
+    return subprocess.run(command, capture_output=True, text=True, **kwargs)
+
+
+# ---------------------------------------------------------------- colour maths
+
+
+def hex_to_rgb(value):
+    value = value.lstrip("#")
+    if len(value) == 3:
+        value = "".join(char * 2 for char in value)
+    if len(value) != 6:
+        raise ThemeError(f"unusable colour {value!r}")
+    return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+
+
+def rgb_to_hex(red, green, blue):
+    clamp = lambda channel: max(0, min(255, int(round(channel))))
+    return f"#{clamp(red):02x}{clamp(green):02x}{clamp(blue):02x}"
+
+
+def rgb_to_hsl(red, green, blue):
+    red, green, blue = red / 255.0, green / 255.0, blue / 255.0
+    high, low = max(red, green, blue), min(red, green, blue)
+    lightness = (high + low) / 2
+    if math.isclose(high, low):
+        return 0.0, 0.0, lightness
+    span = high - low
+    saturation = span / (2 - high - low) if lightness > 0.5 else span / (high + low)
+    if high == red:
+        hue = ((green - blue) / span) % 6
+    elif high == green:
+        hue = (blue - red) / span + 2
+    else:
+        hue = (red - green) / span + 4
+    return hue * 60.0, saturation, lightness
+
+
+def hsl_to_rgb(hue, saturation, lightness):
+    hue = hue % 360.0
+    saturation = max(0.0, min(1.0, saturation))
+    lightness = max(0.0, min(1.0, lightness))
+    chroma = (1 - abs(2 * lightness - 1)) * saturation
+    second = chroma * (1 - abs((hue / 60.0) % 2 - 1))
+    match = lightness - chroma / 2
+    sector = int(hue // 60) % 6
+    table = [
+        (chroma, second, 0.0),
+        (second, chroma, 0.0),
+        (0.0, chroma, second),
+        (0.0, second, chroma),
+        (second, 0.0, chroma),
+        (chroma, 0.0, second),
+    ]
+    red, green, blue = table[sector]
+    return (red + match) * 255, (green + match) * 255, (blue + match) * 255
+
+
+def to_hex(hue, saturation, lightness):
+    return rgb_to_hex(*hsl_to_rgb(hue, saturation, lightness))
+
+
+def relative_luminance(hex_colour):
+    channels = []
+    for channel in hex_to_rgb(hex_colour):
+        value = channel / 255.0
+        channels.append(value / 12.92 if value <= 0.04045
+                        else ((value + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+
+def contrast_ratio(first, second):
+    high, low = sorted((relative_luminance(first), relative_luminance(second)), reverse=True)
+    return (high + 0.05) / (low + 0.05)
+
+
+# Wallpapers routinely put their most vivid colour somewhere unreadable as text,
+# so every colour that ends up on the background gets a contrast floor. Hue and
+# saturation are preserved; only lightness moves.
+MINIMUM_CONTENT_CONTRAST = 3.0
+
+
+def ensure_contrast(colour, background, dark):
+    if contrast_ratio(colour, background) >= MINIMUM_CONTENT_CONTRAST:
+        return colour
+    hue, saturation, lightness = rgb_to_hsl(*hex_to_rgb(colour))
+    towards = 1.0 if dark else 0.0
+    for step in range(1, 41):
+        moved = lightness + (towards - lightness) * (step / 40.0)
+        candidate = to_hex(hue, saturation, moved)
+        if contrast_ratio(candidate, background) >= MINIMUM_CONTENT_CONTRAST:
+            return candidate
+    return to_hex(hue, saturation, towards)
+
+
+def hue_distance(first, second):
+    distance = abs(first - second) % 360.0
+    return min(distance, 360.0 - distance)
+
+
+def shift(hex_colour, lightness_delta=0.0, saturation_factor=1.0):
+    """Nudge an existing colour, used for the background ramp and bright variants."""
+    hue, saturation, lightness = rgb_to_hsl(*hex_to_rgb(hex_colour))
+    return to_hex(hue, saturation * saturation_factor, lightness + lightness_delta)
+
+
+# ------------------------------------------------------------------ extraction
+
+
+def extract_palette(images, count=24):
+    """Quantize one or more images and return [(hex, share)] ordered by share.
+
+    Several images are merged into one weighted histogram, so a theme built
+    from a set of wallpapers is derived from the set rather than from whichever
+    happened to be listed first.
+    """
+    combined = {}
+    for image in images:
+        result = run([
+            "magick", f"{image}[0]", "-auto-orient", "-resize", "10%",
+            "-colors", str(count), "-depth", "8", "-format", "%c", "histogram:info:-",
+        ])
+        if result.returncode != 0:
+            detail = (result.stderr or "").strip().splitlines()
+            raise ThemeError(detail[-1] if detail else
+                             f"magick could not read {image.name}")
+
+        found = 0
+        for line in result.stdout.splitlines():
+            count_match = re.match(r"\s*(\d+):", line)
+            hex_match = re.search(r"#([0-9A-Fa-f]{6})", line)
+            if count_match and hex_match:
+                colour = f"#{hex_match.group(1).lower()}"
+                pixels = int(count_match.group(1))
+                combined[colour] = combined.get(colour, 0) + pixels
+                found += pixels
+        if not found:
+            raise ThemeError(f"no colours could be read from {image.name}")
+
+    total = sum(combined.values())
+    ordered = sorted(combined.items(), key=lambda entry: entry[1], reverse=True)
+    return [(colour, pixels / total) for colour, pixels in ordered]
+
+
+# ------------------------------------------------------------- palette picking
+
+
+def pick_accent(palette):
+    """The most vivid colour that still covers enough of the image to be a theme colour."""
+    best, best_score = None, 0.0
+    for colour, share in palette:
+        hue, saturation, lightness = rgb_to_hsl(*hex_to_rgb(colour))
+        if saturation < 0.18 or not 0.25 <= lightness <= 0.88:
+            continue
+        # Mid-lightness, saturated colours read well as accent; a flat area of
+        # colour beats a bright speck that is one pixel of a gradient.
+        score = saturation * math.log1p(share * 100) * (1 - abs(lightness - 0.62))
+        if score > best_score:
+            best, best_score = colour, score
+    return best
+
+
+def slot_colour(palette, accent_hue, accent_saturation, hue, lightness, saturation, minimum_saturation):
+    """Prefer a real colour from the image; synthesise one from the accent if absent."""
+    best, best_score = None, 0.0
+    for colour, share in palette:
+        colour_hue, colour_saturation, colour_lightness = rgb_to_hsl(*hex_to_rgb(colour))
+        if colour_saturation < minimum_saturation:
+            continue
+        distance = hue_distance(colour_hue, hue)
+        if distance > HUE_TOLERANCE:
+            continue
+        score = (1 - distance / HUE_TOLERANCE) * (0.4 + colour_saturation) * math.log1p(share * 100)
+        if score > best_score:
+            best, best_score = (colour_hue, colour_saturation, colour_lightness), score
+
+    if best is not None:
+        _, found_saturation, _ = best
+        # Clamp toward the slot's usable window without discarding the image's hue.
+        return to_hex(hue, max(found_saturation, minimum_saturation), lightness)
+    return to_hex(hue, max(accent_saturation * 0.85, minimum_saturation), lightness)
+
+
+def build_palette(images):
+    palette = extract_palette(images)
+    dominant = palette[0][0]
+    accent = pick_accent(palette) or dominant
+
+    dominant_hue, dominant_saturation, dominant_lightness = rgb_to_hsl(*hex_to_rgb(dominant))
+    accent_hue, accent_saturation, _ = rgb_to_hsl(*hex_to_rgb(accent))
+
+    total_lightness = sum(
+        rgb_to_hsl(*hex_to_rgb(colour))[2] * share for colour, share in palette
+    )
+    dark = total_lightness < 0.5
+
+    if dark:
+        # Keep a trace of the wallpaper's hue, but well below its own saturation
+        # so UI chrome stays readable over the image.
+        base_hue, base_saturation = dominant_hue, min(dominant_saturation, 0.22) * 0.7
+        ramp = {
+            "darker_background": 0.05,
+            "dark_background": 0.08,
+            "background": 0.12,
+            "lighter_background": 0.18,
+        }
+        text = {
+            "foreground": (0.90, 0.08),
+            "bright_foreground": (0.96, 0.12),
+            "light_foreground": (0.76, 0.10),
+            "dark_foreground": (0.52, 0.10),
+        }
+    else:
+        base_hue, base_saturation = dominant_hue, min(dominant_saturation, 0.30) * 0.5
+        ramp = {
+            "background": 0.95,
+            "lighter_background": 0.97,
+            "dark_background": 0.90,
+            "darker_background": 0.85,
+        }
+        text = {
+            "foreground": (0.22, 0.10),
+            "bright_foreground": (0.12, 0.14),
+            "light_foreground": (0.34, 0.10),
+            "dark_foreground": (0.52, 0.08),
+        }
+
+    colours = {"accent": accent, "mode": "dark" if dark else "light"}
+    for name, lightness in ramp.items():
+        colours[name] = to_hex(base_hue, base_saturation, lightness)
+    for name, (lightness, saturation) in text.items():
+        colours[name] = to_hex(base_hue, min(accent_saturation, saturation + 0.04), lightness)
+
+    colours["selection"] = to_hex(accent_hue, min(accent_saturation, 0.35),
+                                  0.28 if dark else 0.80)
+    # muted is the dimmer of the two text roles, but it is still text: at 0.20
+    # lightness against a 0.12 background it was effectively invisible, which is
+    # what made secondary labels unreadable in the Theme Studio.
+    colours["muted"] = to_hex(accent_hue, min(accent_saturation, 0.22),
+                              0.52 if dark else 0.45)
+
+    for name, (hue, saturation, lightness, minimum) in SLOTS.items():
+        colours[name] = slot_colour(palette, accent_hue, accent_saturation,
+                                    hue, lightness, saturation, minimum)
+    for name in BRIGHT_SLOTS:
+        hue_value, saturation_value, lightness_value = rgb_to_hsl(*hex_to_rgb(colours[name]))
+        target = 0.78 if dark else 0.32
+        lightness_value += (target - lightness_value) * 0.75
+        saturation_value = min(1.0, saturation_value * 1.08)
+        colours[f"bright_{name}"] = to_hex(hue_value, saturation_value, lightness_value)
+
+    content = ["accent", "selection", "muted", *SLOTS,
+               *[f"bright_{name}" for name in BRIGHT_SLOTS]]
+    background = colours["background"]
+    for name in content:
+        colours[name] = ensure_contrast(colours[name], background, dark)
+
+    return colours, dark
+
+
+ORDER = [
+    "mode", "accent", "selection", "muted",
+    "background", "dark_background", "darker_background", "lighter_background",
+    "foreground", "dark_foreground", "light_foreground", "bright_foreground",
+    "hyprland_active_border", "hyprland_inactive_border",
+    "red", "yellow", "orange", "green", "cyan", "blue", "magenta", "brown",
+    "bright_red", "bright_yellow", "bright_green", "bright_cyan",
+    "bright_blue", "bright_magenta",
+]
+
+
+def render_colors_toml(colours, dark):
+    accent = colours["accent"].lstrip("#")
+    lines = [f'mode = "{"dark" if dark else "light"}"', ""]
+    for key in ORDER:
+        if key in ("mode", "hyprland_active_border", "hyprland_inactive_border"):
+            continue
+        lines.append(f'{key} = "{colours[key]}"')
+    # The border is a two-stop gradient, the second stop rotated off the accent
+    # so the active border reads as a gradient rather than a flat outline.
+    hue, saturation, lightness = rgb_to_hsl(*hex_to_rgb(colours["accent"]))
+    second = to_hex(hue + 38.0, saturation, min(1.0, lightness + 0.08)).lstrip("#")
+    lines.append(f'hyprland_active_border = "rgba({accent}ee) rgba({second}ee) 45deg"')
+    lines.append(f'hyprland_inactive_border = "rgba({accent}44)"')
+    return "\n".join(lines) + "\n"
+
+
+def emit(payload):
+    print(json.dumps(payload))
+
+
+def slugify(name):
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    if not slug or slug.startswith("."):
+        raise ThemeError(f"{name!r} does not make a usable theme name")
+    return slug
+
+
+def default_name(image):
+    return image.stem
+
+
+# ------------------------------------------------------------------ inspection
+
+COLOR_KEYS = [key for key in ORDER if key != "mode"]
+
+
+def read_colors(path):
+    """Minimal TOML read for a flat colors.toml. Omarchy themes are flat strings."""
+    colours = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+                value = value[1:-1]
+            if key:
+                colours[key] = value
+    except OSError:
+        return {}
+    return colours
+
+
+def theme_entry(slug, path, user, active):
+    colours = read_colors(path / "colors.toml")
+    backgrounds = []
+    for item in sorted(existing_backgrounds(path)):
+        backgrounds.append({
+            "path": str(item),
+            "name": item.stem,
+            "ext": item.suffix.lower().lstrip("."),
+        })
+    return {
+        "slug": slug,
+        "name": re.sub(r"-", " ", slug).title(),
+        "path": str(path),
+        "user": user,
+        "active": active,
+        "mode": colours.get("mode", ""),
+        "backgrounds": backgrounds,
+        "colors": {key: colours.get(key, "") for key in COLOR_KEYS},
+    }
+
+
+def collect_themes():
+    active = ""
+    try:
+        active = (Path.home() / ".local/state/omarchy/current/theme.name").read_text().strip()
+    except OSError:
+        pass
+
+    stock_root = Path(os.environ.get("OMARCHY_PATH", "/usr/share/omarchy")) / "themes"
+    seen, entries = set(), []
+    for root, user in ((stock_root, False), (USER_THEMES, True)):
+        if not root.is_dir():
+            continue
+        for directory in sorted(root.iterdir()):
+            if not directory.is_dir() or directory.name in seen:
+                continue
+            seen.add(directory.name)
+            entries.append(theme_entry(directory.name, directory, user,
+                                       directory.name == active))
+    return entries
+
+
+def list_background_files(directory):
+    supported = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+    if not directory.is_dir():
+        return []
+    found = []
+    for item in sorted(directory.iterdir()):
+        if item.is_file() and item.suffix.lower() in supported:
+            found.append({
+                "path": str(item),
+                "name": item.stem,
+                "ext": item.suffix.lower().lstrip("."),
+            })
+    return found
+
+
+# --------------------------------------------------------------------- writing
+
+
+def file_digest(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.digest()
+
+
+def already_stored(backgrounds, candidate):
+    """True when a byte-identical file is already in the theme's backgrounds."""
+    wanted = file_digest(candidate)
+    for entry in backgrounds.iterdir():
+        if not entry.is_file() or entry == candidate:
+            continue
+        try:
+            if file_digest(entry) == wanted:
+                return entry
+        except OSError:
+            continue
+    return None
+
+
+def unique_stem(backgrounds, preferred):
+    # omarchy-theme-bg-switcher hides name variants as a single entry, so
+    # disambiguate rather than let one background silently mask another.
+    taken = {entry.stem.lower() for entry in backgrounds.iterdir() if entry.is_file()}
+    stem = preferred
+    counter = 2
+    while stem.lower() in taken:
+        stem = f"{preferred}-{counter}"
+        counter += 1
+    return stem
+
+
+def store_background(backgrounds, image, preferred_stem):
+    """Put the wallpaper where omarchy-theme-set will look for it.
+
+    Returns (stored path, transcoded, already present). A theme can end up
+    carrying the same picture twice -- copied in from a different folder, or
+    re-added by hand -- so the duplicate test is on content, not on the path.
+    """
+    extension = image.suffix.lower().lstrip(".")
+    if extension == "jpeg":
+        extension = "jpg"
+    transcode = extension not in OMARCHY_BACKGROUND_EXTENSIONS
+    if transcode:
+        # Not a format the theme switcher will find, so convert rather than
+        # leave the theme without a background.
+        extension = "png"
+
+    if not transcode:
+        try:
+            if image.samefile(backgrounds / f"{preferred_stem}.{extension}"):
+                return backgrounds / f"{preferred_stem}.{extension}", False, True
+        except OSError:
+            pass
+        present = already_stored(backgrounds, image)
+        if present is not None:
+            return present, False, True
+
+    stem = unique_stem(backgrounds, preferred_stem)
+    destination = backgrounds / f"{stem}.{extension}"
+    if transcode:
+        result = run(["magick", f"{image}[0]", "-auto-orient", f"PNG32:{destination}"])
+        if result.returncode != 0 or not destination.is_file():
+            if destination.exists():
+                destination.unlink()
+            raise ThemeError(f"could not convert {image.name} to png for the theme background")
+        present = already_stored(backgrounds, destination)
+        if present is not None:
+            destination.unlink()
+            return present, False, True
+    else:
+        shutil.copy2(image, destination)
+    return destination, transcode, False
+
+
+def existing_backgrounds(target):
+    folder = target / "backgrounds"
+    if not folder.is_dir():
+        return []
+    return sorted(
+        entry for entry in folder.iterdir()
+        if entry.is_file() and entry.suffix.lower().lstrip(".") in OMARCHY_BACKGROUND_EXTENSIONS
+    )
+
+
+def write_theme(slug, colours, dark, images, name_after_slug=True):
+    target = USER_THEMES / slug
+    backgrounds = target / "backgrounds"
+    backgrounds.mkdir(parents=True, exist_ok=True)
+
+    added, transcoded = [], []
+    for index, image in enumerate(images):
+        stem = slug if (index == 0 and name_after_slug) else image.stem
+        destination, was_transcoded, already = store_background(backgrounds, image, stem)
+        if already:
+            continue
+        added.append(destination)
+        if was_transcoded:
+            transcoded.append(f"{image.name} -> {destination.name}")
+
+    if not added:
+        return target, [], []
+    if colours is not None:
+        (target / "colors.toml").write_text(render_colors_toml(colours, dark), encoding="utf-8")
+    return target, added, transcoded
+
+
+def apply_theme(slug):
+    if shutil.which("omarchy") is None:
+        raise ThemeError("omarchy is not on PATH, so the theme was not applied")
+    result = run(["omarchy", "theme", "set", slug])
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        raise ThemeError(detail[-1] if detail else "omarchy theme set failed")
+
+
+def rename_theme(old, new):
+    """Move a generated theme to a new slug, keeping its backgrounds."""
+    source = USER_THEMES / old
+    target = USER_THEMES / new
+
+    if not source.is_dir() or source.is_symlink():
+        raise ThemeError(f"no theme called '{old}' in {USER_THEMES}")
+    if target.exists() or target.is_symlink():
+        raise ThemeError(f"a theme called '{new}' already exists")
+    if old == new:
+        raise ThemeError("the new name is the same as the old one")
+
+    # Renaming the source directory leaves the staged copy and the background
+    # symlink rendering fine, but theme.name is what `omarchy theme bg next`
+    # reads, so keep it pointing at a theme that exists.
+    active_file = Path.home() / ".local/state/omarchy/current/theme.name"
+    was_active = False
+    try:
+        was_active = active_file.read_text().strip() == old
+    except OSError:
+        pass
+
+    try:
+        source.rename(target)
+    except OSError as error:
+        raise ThemeError(f"could not rename {old}: {error.strerror or error}")
+
+    if was_active:
+        active_file.write_text(new + "\n", encoding="utf-8")
+    return was_active
+
+
+# ----------------------------------------------------------------- entry point
+
+
+def pick_images():
+    """Ask the desktop chooser for one or more wallpapers."""
+    chooser = shutil.which("omarchy-file-select")
+    if chooser is None:
+        raise ThemeError("omarchy-file-select is not on PATH, so pass image paths instead")
+    result = run([chooser, "--title", "Generate theme from image",
+                  "--multiple", "--extensions", CHOOSER_EXTENSIONS])
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+    # The chooser prints one path per line, and can repeat a selection.
+    chosen = []
+    for line in result.stdout.splitlines():
+        candidate = Path(line.strip())
+        if candidate.is_file() and candidate not in chosen:
+            chosen.append(candidate)
+    return chosen
+
+
+def preview(colours, dark, limit=6):
+    print(f'mode = "{dark and "dark" or "light"}"')
+    swatch = "  ".join(f"{colour}" for colour in
+                       [colours["background"], colours["accent"], colours["foreground"]])
+    print(f"  base   {swatch}")
+    names = ["red", "yellow", "orange", "green", "cyan", "blue", "magenta", "brown"]
+    print("  ansi   " + "  ".join(colours[name] for name in names))
+    print("  bright " + "  ".join(colours[f"bright_{name}"] for name in BRIGHT_SLOTS))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate an Omarchy theme from a wallpaper.")
+    parser.add_argument("image", nargs="*",
+                        help="wallpaper(s) to derive the theme from; several become a "
+                             "set the theme cycles through with 'omarchy theme bg next'")
+    parser.add_argument("--name", help="theme name (defaults to the first image's filename)")
+    parser.add_argument("--pick", action="store_true",
+                        help="choose one or more wallpapers with the desktop file chooser")
+    parser.add_argument("--add", action="store_true",
+                        help="add backgrounds to an existing theme instead of "
+                             "replacing it, re-deriving the palette from the whole set")
+    parser.add_argument("--keep-colors", action="store_true",
+                        help="with --add, store the new backgrounds and leave colors.toml alone")
+    parser.add_argument("--rename", metavar="OLD",
+                        help="with --to, rename a generated theme and its backgrounds")
+    parser.add_argument("--to", metavar="NEW",
+                        help="new theme name for --rename")
+    parser.add_argument("--list", action="store_true",
+                        help="print every theme and its backgrounds as JSON, then exit")
+    parser.add_argument("--images-in", metavar="DIR",
+                        help="list the images in DIR as JSON, for the Theme Studio picker")
+    parser.add_argument("--json", action="store_true",
+                        help="with --preview, print the palette as JSON")
+    parser.add_argument("--preview", action="store_true",
+                        help="print the palette without writing a theme")
+    parser.add_argument("--no-apply", action="store_true",
+                        help="write the theme but do not switch to it")
+    arguments = parser.parse_args()
+
+    try:
+        if arguments.list:
+            emit(collect_themes())
+            return 0
+        if arguments.images_in:
+            emit(list_background_files(Path(arguments.images_in).expanduser()))
+            return 0
+        if arguments.rename or arguments.to:
+            if not (arguments.rename and arguments.to):
+                raise ThemeError("--rename needs both the old and the new name (--to)")
+            slug = slugify(arguments.to)
+            was_active = rename_theme(arguments.rename, slug)
+            print(f"Renamed {arguments.rename} to {slug}")
+            if was_active:
+                print("It was the active theme; re-apply it with: "
+                      f"omarchy theme set {slug}")
+            return 0
+
+        if arguments.pick or not arguments.image:
+            if not arguments.pick and not arguments.image:
+                raise ThemeError("give an image path, or --pick to choose one")
+            images = pick_images()
+            if not images:
+                print("No image chosen.")
+                return 0
+            if len(images) > 1:
+                print(f"Chose {len(images)} images.")
+        else:
+            images = [Path(value).expanduser() for value in arguments.image]
+
+        for image in images:
+            if not image.is_file():
+                raise ThemeError(f"no such image: {image}")
+
+        slug = slugify(arguments.name or default_name(images[0]))
+
+        if arguments.keep_colors and not arguments.add:
+            raise ThemeError("--keep-colors only applies together with --add")
+
+        if arguments.add:
+            target = USER_THEMES / slug
+            if not (target / "colors.toml").is_file():
+                raise ThemeError(f"no generated theme called '{slug}' to add to")
+            if not arguments.keep_colors:
+                # Re-derive from everything the theme will end up carrying, so the
+                # palette still fits the backgrounds already in it.
+                already = existing_backgrounds(target)
+                present = {path.resolve() for path in already}
+                derivation = already + [image for image in images
+                                         if image.resolve() not in present]
+                colours, dark = build_palette(derivation)
+            else:
+                colours, dark = None, None
+        else:
+            colours, dark = build_palette(images)
+
+        if arguments.preview:
+            if arguments.json:
+                emit(dict(colours, mode="dark" if dark else "light"))
+            else:
+                preview(colours, dark)
+            return 0
+
+        if arguments.add and arguments.keep_colors:
+            target = USER_THEMES / slug
+            if not (target / "colors.toml").is_file():
+                raise ThemeError(f"no generated theme called '{slug}' to add to")
+            target, added, transcoded = write_theme(
+                slug, None, None, images, name_after_slug=False)
+            if not added:
+                print(f"'{slug}' already has those backgrounds.")
+                return 0
+            print(f"Added {len(added)} background(s) to '{slug}'; colors.toml left as it was.")
+        else:
+            target, added, transcoded = write_theme(
+                slug, colours, dark, images, name_after_slug=not arguments.add)
+            if not added:
+                print(f"'{slug}' already has those backgrounds.")
+                return 0
+            print(f"Wrote theme '{slug}' to {target}")
+
+        for note in transcoded:
+            print(f"Converted {note} for the theme background.")
+
+        if len(added) > 1:
+            print(f"{len(added)} backgrounds stored; cycle them with: omarchy theme bg next")
+
+        if not arguments.no_apply:
+            apply_theme(slug)
+            print(f"Applied '{slug}'.")
+        else:
+            print(f"Apply it with: omarchy theme set {slug}")
+        return 0
+    except ThemeError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
