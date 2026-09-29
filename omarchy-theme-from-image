@@ -25,7 +25,24 @@ USER_THEMES = Path.home() / ".config" / "omarchy" / "themes"
 # source, but it has to be converted before it is stored, or the theme applies
 # with no background at all.
 OMARCHY_BACKGROUND_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "gif"}
-CHOOSER_EXTENSIONS = "png jpg jpeg webp bmp gif avif jxl heic tif tiff"
+# Long edge a stored background is capped at. A phone photo is 12 megapixel and
+# an iPhone one is 48, and writing 8064x6048 out as a png costs about a minute
+# and 50 MB for an image the compositor scales to the screen anyway. 4K is well
+# past any desktop's resolution, so nothing visible is lost.
+MAX_BACKGROUND_EDGE = 3840
+# Every image the tool can turn into a theme background. This is a superset of
+# what a theme is allowed to store: anything outside OMARCHY_BACKGROUND_EXTENSIONS
+# is transcoded to png by store_background, so a phone's .HEIC is as usable as
+# a .jpg and the studio must not filter it out of the picker.
+SOURCE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif",
+                     ".avif", ".jxl", ".heic", ".tif", ".tiff"}
+# The subset Qt can decode, and so the subset the studio's grid can show without
+# help. Everything else needs a preview converted for it first; see make_thumbnail.
+PREVIEWABLE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif",
+                          ".tif", ".tiff"}
+# What the desktop chooser offers. Derived from the list above so the portal and
+# the in-panel picker can never drift into offering different formats.
+CHOOSER_EXTENSIONS = " ".join(sorted(ext.lstrip(".") for ext in SOURCE_EXTENSIONS))
 
 # Target hue (degrees) and usable lightness/saturation window for each ANSI slot.
 # The window keeps a match usable as terminal text; a wallpaper's own shade of a
@@ -232,7 +249,28 @@ def slot_colour(palette, accent_hue, accent_saturation, hue, lightness, saturati
     return to_hex(hue, max(accent_saturation * 0.85, minimum_saturation), lightness)
 
 
-def build_palette(images):
+def measure_lightness(palette):
+    """The share-weighted mean lightness of a palette, which is what picks the mode.
+
+    The average over every pixel, not the dominant colour: a photo of a bright
+    sky over a dark room averages out to something in between, and that is the
+    number the light/dark decision turns on.
+    """
+    return sum(rgb_to_hsl(*hex_to_rgb(colour))[2] * share for colour, share in palette)
+
+
+def build_palette(images, mode="auto"):
+    """Derive a full palette from `images`. Returns (colours, dark, mean lightness).
+
+    `mode` is "auto", "dark" or "light". Auto measures the images; the other two
+    override that, for when the measurement is not what the user wants -- a
+    wallpaper of a bright sky averages light however the room actually feels.
+
+    The third value is the measured mean when the mode was auto, so a caller
+    can explain the decision instead of leaving the user to wonder why a dark
+    room came out light. It is 0.0 when the mode was forced, because the
+    measurement is then not what decided anything.
+    """
     palette = extract_palette(images)
     dominant = palette[0][0]
     accent = pick_accent(palette) or dominant
@@ -240,10 +278,14 @@ def build_palette(images):
     dominant_hue, dominant_saturation, dominant_lightness = rgb_to_hsl(*hex_to_rgb(dominant))
     accent_hue, accent_saturation, _ = rgb_to_hsl(*hex_to_rgb(accent))
 
-    total_lightness = sum(
-        rgb_to_hsl(*hex_to_rgb(colour))[2] * share for colour, share in palette
-    )
-    dark = total_lightness < 0.5
+    # Named for what it is, and not `lightness`: the ramp and slot loops below
+    # bind that name themselves, which would silently replace this measurement
+    # with whichever slot was coloured last.
+    mean_lightness = measure_lightness(palette)
+    if mode == "auto":
+        dark = mean_lightness < 0.5
+    else:
+        dark = mode == "dark"
 
     if dark:
         # Keep a trace of the wallpaper's hue, but well below its own saturation
@@ -306,7 +348,7 @@ def build_palette(images):
     for name in content:
         colours[name] = ensure_contrast(colours[name], background, dark)
 
-    return colours, dark
+    return colours, dark, (mean_lightness if mode == "auto" else 0.0)
 
 
 ORDER = [
@@ -551,18 +593,188 @@ def collect_themes():
 
 
 def list_background_files(directory):
-    supported = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+    """Every image in `directory` the studio could pick, newest name order.
+
+    Not restricted to what a theme may store: .HEIC and friends are listed
+    because store_background converts them, and a wallpaper the studio refuses
+    to offer is one the user cannot build a theme from at all.
+    """
     if not directory.is_dir():
         return []
     found = []
-    for item in sorted(directory.iterdir()):
-        if item.is_file() and item.suffix.lower() in supported:
-            found.append({
-                "path": str(item),
-                "name": item.stem,
-                "ext": item.suffix.lower().lstrip("."),
-            })
+    # Case-insensitive, so a phone roll of IMG_2596.HEIC sorts by its name
+    # rather than by the case of its extension.
+    for item in sorted(directory.iterdir(), key=lambda entry: entry.name.lower()):
+        extension = item.suffix.lower()
+        if not item.is_file() or extension not in SOURCE_EXTENSIONS:
+            continue
+        found.append({
+            "path": str(item),
+            "name": item.stem,
+            "ext": extension.lstrip("."),
+            # Empty for formats Qt cannot decode, which is the studio's cue to
+            # convert a preview before it has anything to show.
+            "preview": str(item) if extension in PREVIEWABLE_EXTENSIONS else "",
+        })
     return found
+
+
+# --------------------------------------------------------------- folder browse
+
+# Starting points offered as one-click rows in the studio's folder browser. Only
+# the ones that exist are listed, so the row is never a dead end. Pictures and
+# Downloads are where wallpapers actually live; the rest are here because they
+# are the XDG user dirs and cost nothing to offer.
+BROWSE_SHORTCUTS = (
+    ("Home", Path.home()),
+    ("Pictures", Path.home() / "Pictures"),
+    ("Downloads", Path.home() / "Downloads"),
+    ("Desktop", Path.home() / "Desktop"),
+    ("Music", Path.home() / "Music"),
+    ("Videos", Path.home() / "Videos"),
+    ("Themes", USER_THEMES),
+)
+
+
+def count_images(directory):
+    """How many images in `directory` the studio could pick from it.
+
+    Counted over the same set the grid lists, so the number beside a folder is
+    the number the grid will hold -- otherwise a folder of .HEIC wallpaper reads
+    as empty while holding nothing but wallpaper.
+    """
+    try:
+        return sum(1 for item in directory.iterdir()
+                   if item.is_file() and item.suffix.lower() in SOURCE_EXTENSIONS)
+    except OSError:
+        return 0
+
+
+def list_subdirectories(directory):
+    """The subfolders of `directory`, with an image count for each.
+
+    Dot-folders are skipped, matching what a file chooser shows, and folders the
+    user cannot read are listed without a count rather than dropped -- hiding a
+    folder that exists is worse than showing it with a 0.
+    """
+    found = []
+    try:
+        entries = sorted(directory.iterdir())
+    except OSError:
+        return found
+    for item in entries:
+        if item.name.startswith("."):
+            continue
+        try:
+            if not item.is_dir():
+                continue
+        except OSError:
+            continue
+        found.append({
+            "name": item.name,
+            "path": str(item),
+            "images": count_images(item),
+        })
+    return found
+
+
+def browse_directory(requested):
+    """Describe one folder for the studio's in-panel folder browser.
+
+    Returns the folder, its parent, its subfolders and the shortcut rows. A path
+    that is not a readable directory comes back as an `error` in the same shape
+    rather than as a failure, so the browser can say what is wrong and stay open
+    instead of the user being left on a blank panel.
+    """
+    target = Path(str(requested or "")).expanduser()
+    try:
+        # resolve() rather than abspath: a symlinked home or an autofs mount can
+        # make the same folder answer to two paths, and the browser should show
+        # the one it will actually list.
+        target = target.resolve()
+    except OSError as error:
+        return {"error": f"could not read {requested}: {error.strerror or error}",
+                "path": str(requested), "parent": "", "images": 0,
+                "dirs": [], "shortcuts": []}
+
+    if not target.is_dir():
+        return {"error": f"{target} is not a folder", "path": str(requested),
+                "parent": "", "images": 0, "dirs": [], "shortcuts": []}
+    if not os.access(target, os.R_OK | os.X_OK):
+        return {"error": f"{target} is not readable", "path": str(target),
+                "parent": "", "images": 0, "dirs": [], "shortcuts": []}
+
+    shortcuts = []
+    for name, path in BROWSE_SHORTCUTS:
+        try:
+            if path.is_dir():
+                shortcuts.append({"name": name, "path": str(path)})
+        except OSError:
+            continue
+
+    return {
+        "path": str(target),
+        "parent": str(target.parent) if target.parent != target else "",
+        "images": count_images(target),
+        "dirs": list_subdirectories(target),
+        "shortcuts": shortcuts,
+    }
+
+
+# ------------------------------------------------------------------ thumbnails
+
+# Previews for the formats Qt cannot decode. They are worth caching: decoding a
+# phone-sized .HEIC costs about a second, and a folder of them would otherwise
+# pay that again on every visit to the picker.
+THUMBNAIL_CACHE = (Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+                   / "omarchy" / "theme-studio")
+# Big enough to stay crisp on a hidpi grid, small enough that the grid is not
+# decoding full-size photographs to draw a 120px tile. The ">" shrinks only, so
+# a small source is never blown up.
+THUMBNAIL_EDGE = 512
+
+
+def thumbnail_path(source):
+    """Where a converted preview of `source` belongs in the cache.
+
+    Keyed on the size and mtime as well as the path, so an image that was
+    edited or re-exported in place gets a fresh preview rather than the stale
+    one, and two folders holding the same filename cannot collide.
+    """
+    try:
+        stat = source.stat()
+    except OSError as error:
+        raise ThemeError(f"could not read {source}: {error.strerror or error}")
+    digest = hashlib.sha256(
+        f"{source}\0{stat.st_size}\0{stat.st_mtime_ns}".encode("utf-8")
+    ).hexdigest()[:24]
+    return THUMBNAIL_CACHE / f"{digest}.png"
+
+
+def make_thumbnail(source):
+    """Convert `source` to a png preview in the cache and return its path.
+
+    Returns the existing preview untouched if there already is one, so this is
+    cheap to call on every tile that needs it.
+    """
+    target = thumbnail_path(source)
+    if target.is_file():
+        return target
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Written beside the target and moved into place, so an interrupted run
+    # never leaves a truncated png for the grid to load and cache forever.
+    scratch = target.with_name(target.name + ".part")
+    result = run(["magick", f"{source}[0]", "-auto-orient",
+                  "-resize", f"{THUMBNAIL_EDGE}x{THUMBNAIL_EDGE}>",
+                  f"PNG32:{scratch}"])
+    if result.returncode != 0 or not scratch.is_file():
+        scratch.unlink(missing_ok=True)
+        detail = (result.stderr or "").strip().splitlines()
+        raise ThemeError(detail[-1] if detail
+                         else f"could not make a preview of {source.name}")
+    shutil.move(str(scratch), str(target))
+    return target
 
 
 # --------------------------------------------------------------------- writing
@@ -577,7 +789,11 @@ def file_digest(path):
 
 
 def already_stored(backgrounds, candidate):
-    """True when a byte-identical file is already in the theme's backgrounds."""
+    """True when a byte-identical file is already in the theme's backgrounds.
+
+    Only ever true for a file that was copied across unchanged, which is exactly
+    why it is not the whole duplicate test: see read_sources.
+    """
     wanted = file_digest(candidate)
     for entry in backgrounds.iterdir():
         if not entry.is_file() or entry == candidate:
@@ -588,6 +804,58 @@ def already_stored(backgrounds, candidate):
         except OSError:
             continue
     return None
+
+
+# Which stored background came from which source image, one "<digest> <name>"
+# pair per line. Comparing the source to the stored file cannot spot a duplicate
+# once the image has been transcoded, because the stored png is a different file
+# from the heic it came from -- so the same wallpaper is stored again under a
+# second name every time it is added twice. This remembers the source instead.
+#
+# It lives beside the theme's colors.toml rather than in backgrounds/ so that
+# omarchy-theme-set, which scans that folder for wallpapers, never sees it.
+def sources_manifest(backgrounds):
+    return backgrounds.parent / ".sources"
+
+
+def read_sources(backgrounds):
+    """Map each known source digest to the background it was stored as."""
+    found = {}
+    try:
+        lines = sources_manifest(backgrounds).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return found
+    for line in lines:
+        digest, _, name = line.partition(" ")
+        if digest and name:
+            found[digest] = name
+    return found
+
+
+def write_source(backgrounds, image, stored):
+    """Record that `stored` is `image`, so adding the same image again is a
+    no-op rather than a second copy."""
+    try:
+        known = read_sources(backgrounds)
+        known[hashlib.sha256(file_digest(image)).hexdigest()] = stored.name
+        sources_manifest(backgrounds).write_text(
+            "".join(f"{digest} {name}\n" for digest, name in sorted(known.items())),
+            encoding="utf-8",
+        )
+    except OSError:
+        # Losing the record only costs a duplicate wallpaper next time, so it is
+        # not worth failing a write over.
+        pass
+
+
+def stored_from_source(backgrounds, image):
+    """The background already holding this image, by identity rather than bytes."""
+    recorded = read_sources(backgrounds).get(
+        hashlib.sha256(file_digest(image)).hexdigest())
+    if recorded is None:
+        return None
+    candidate = backgrounds / recorded
+    return candidate if candidate.is_file() else None
 
 
 def unique_stem(backgrounds, preferred):
@@ -607,7 +875,8 @@ def store_background(backgrounds, image, preferred_stem):
 
     Returns (stored path, transcoded, already present). A theme can end up
     carrying the same picture twice -- copied in from a different folder, or
-    re-added by hand -- so the duplicate test is on content, not on the path.
+    re-added by hand -- so the duplicate test is on the source's identity, which
+    survives transcoding, and on content, which catches a hand-copied file.
     """
     extension = image.suffix.lower().lstrip(".")
     if extension == "jpeg":
@@ -617,6 +886,13 @@ def store_background(backgrounds, image, preferred_stem):
         # Not a format the theme switcher will find, so convert rather than
         # leave the theme without a background.
         extension = "png"
+
+    # First, for every format: have we been given this exact image before? This
+    # is the test that has to come first, because it is the only one that works
+    # once the stored file is a re-encoded png rather than a copy of the source.
+    present = stored_from_source(backgrounds, image)
+    if present is not None:
+        return present, False, True
 
     if not transcode:
         try:
@@ -631,17 +907,27 @@ def store_background(backgrounds, image, preferred_stem):
     stem = unique_stem(backgrounds, preferred_stem)
     destination = backgrounds / f"{stem}.{extension}"
     if transcode:
-        result = run(["magick", f"{image}[0]", "-auto-orient", f"PNG32:{destination}"])
+        # Capped on the way out, and the ">" only ever shrinks, so this is a no-op
+        # for a source already within 4K. The alternative is writing a 48-megapixel
+        # png, which is the slowest thing this tool does by a wide margin.
+        result = run(["magick", f"{image}[0]", "-auto-orient",
+                      "-resize", f"{MAX_BACKGROUND_EDGE}x{MAX_BACKGROUND_EDGE}>",
+                      f"PNG32:{destination}"])
         if result.returncode != 0 or not destination.is_file():
             if destination.exists():
                 destination.unlink()
             raise ThemeError(f"could not convert {image.name} to png for the theme background")
         present = already_stored(backgrounds, destination)
         if present is not None:
+            # A backstop, not the guarantee. ImageMagick's png encoder is not
+            # byte-reproducible -- two conversions of one image give the same
+            # pixels and different bytes -- so this misses as often as it hits.
+            # The manifest above is what actually stops a duplicate.
             destination.unlink()
             return present, False, True
     else:
         shutil.copy2(image, destination)
+    write_source(backgrounds, image, destination)
     return destination, transcode, False
 
 
@@ -655,7 +941,16 @@ def existing_backgrounds(target):
     )
 
 
-def write_theme(slug, colours, dark, images, name_after_slug=True):
+def write_theme(slug, colours, dark, images, name_after_slug=True, recolour=False):
+    """Write a theme's backgrounds and palette.
+
+    `recolour` writes colors.toml even when every image was already stored. It
+    is what makes "generate it, then generate it again as dark" work: the
+    wallpapers are already there, so without it the second run finds nothing to
+    add and leaves the palette exactly as it was. Only the caller knows a
+    recolour was meant, because otherwise a re-run would quietly discard edits
+    made on the Colours page.
+    """
     target = USER_THEMES / slug
     backgrounds = target / "backgrounds"
     backgrounds.mkdir(parents=True, exist_ok=True)
@@ -670,7 +965,7 @@ def write_theme(slug, colours, dark, images, name_after_slug=True):
         if was_transcoded:
             transcoded.append(f"{image.name} -> {destination.name}")
 
-    if not added:
+    if not added and not recolour:
         return target, [], []
     if colours is not None:
         (target / "colors.toml").write_text(render_colors_toml(colours, dark), encoding="utf-8")
@@ -755,8 +1050,22 @@ def pick_images():
     return chosen
 
 
-def preview(colours, dark, limit=6):
+def describe_mode(dark, lightness, mode):
+    """One line saying which mode came out and what decided it.
+
+    The measurement is included because the automatic decision is a mean over
+    the whole set, and without the number a light theme from dark-looking photos
+    looks like a bug rather than an average that landed over the line.
+    """
+    if mode == "auto":
+        return (f"mode: {'dark' if dark else 'light'}"
+                f" (mean lightness {lightness:.3f}, auto picks dark below 0.500)")
+    return f"mode: {mode} (forced)"
+
+
+def preview(colours, dark, lightness=0.0, mode="auto", limit=6):
     print(f'mode = "{dark and "dark" or "light"}"')
+    print("  " + describe_mode(dark, lightness, mode))
     swatch = "  ".join(f"{colour}" for colour in
                        [colours["background"], colours["accent"], colours["foreground"]])
     print(f"  base   {swatch}")
@@ -779,6 +1088,11 @@ def main():
                              "replacing it, re-deriving the palette from the whole set")
     parser.add_argument("--keep-colors", action="store_true",
                         help="with --add, store the new backgrounds and leave colors.toml alone")
+    parser.add_argument("--mode", choices=("auto", "dark", "light"), default="auto",
+                        help="force the palette's light or dark instead of deciding "
+                             "from the images' mean lightness. Forcing a mode also "
+                             "rewrites colors.toml of an existing theme, even when "
+                             "the wallpapers are already there")
     parser.add_argument("--rename", metavar="OLD",
                         help="with --to, rename a generated theme and its backgrounds")
     parser.add_argument("--to", metavar="NEW",
@@ -796,6 +1110,13 @@ def main():
                         help="print every theme and its backgrounds as JSON, then exit")
     parser.add_argument("--images-in", metavar="DIR",
                         help="list the images in DIR as JSON, for the Theme Studio picker")
+    parser.add_argument("--browse", metavar="DIR",
+                        help="describe DIR as JSON -- its parent, its subfolders, "
+                             "and how many images each holds -- for the Theme Studio's "
+                             "in-panel folder browser")
+    parser.add_argument("--thumb", metavar="IMAGE",
+                        help="convert IMAGE to a cached png preview and print its "
+                             "path; for the formats Qt cannot decode, such as .HEIC")
     parser.add_argument("--json", action="store_true",
                         help="with --preview, print the palette as JSON")
     parser.add_argument("--preview", action="store_true",
@@ -810,6 +1131,12 @@ def main():
             return 0
         if arguments.images_in:
             emit(list_background_files(Path(arguments.images_in).expanduser()))
+            return 0
+        if arguments.browse:
+            emit(browse_directory(arguments.browse))
+            return 0
+        if arguments.thumb:
+            print(make_thumbnail(Path(arguments.thumb).expanduser()))
             return 0
         if arguments.groups:
             emit([{"title": title, "keys": list(keys)} for title, keys in EDIT_GROUPS])
@@ -855,7 +1182,13 @@ def main():
 
         if arguments.keep_colors and not arguments.add:
             raise ThemeError("--keep-colors only applies together with --add")
+        if arguments.mode != "auto" and arguments.keep_colors:
+            # Asking for a specific palette and for the palette to be left alone
+            # are opposites; guessing which one was meant would be worse.
+            raise ThemeError("--mode asks for a palette, so it cannot go with "
+                             "--keep-colors, which asks to leave it alone")
 
+        forced = arguments.mode != "auto"
         if arguments.add:
             target = USER_THEMES / slug
             if not (target / "colors.toml").is_file():
@@ -867,17 +1200,17 @@ def main():
                 present = {path.resolve() for path in already}
                 derivation = already + [image for image in images
                                          if image.resolve() not in present]
-                colours, dark = build_palette(derivation)
+                colours, dark, lightness = build_palette(derivation, arguments.mode)
             else:
-                colours, dark = None, None
+                colours, dark, lightness = None, None, 0.0
         else:
-            colours, dark = build_palette(images)
+            colours, dark, lightness = build_palette(images, arguments.mode)
 
         if arguments.preview:
             if arguments.json:
                 emit(dict(colours, mode="dark" if dark else "light"))
             else:
-                preview(colours, dark)
+                preview(colours, dark, lightness, arguments.mode)
             return 0
 
         if arguments.add and arguments.keep_colors:
@@ -892,11 +1225,19 @@ def main():
             print(f"Added {len(added)} background(s) to '{slug}'; colors.toml left as it was.")
         else:
             target, added, transcoded = write_theme(
-                slug, colours, dark, images, name_after_slug=not arguments.add)
+                slug, colours, dark, images, name_after_slug=not arguments.add,
+                recolour=forced)
             if not added:
-                print(f"'{slug}' already has those backgrounds.")
-                return 0
-            print(f"Wrote theme '{slug}' to {target}")
+                if not forced:
+                    print(f"'{slug}' already has those backgrounds.")
+                    return 0
+                # The wallpapers were already there, but a specific mode was asked
+                # for, so the palette was rewritten. Say so, because that is the
+                # one case where a re-run changes an existing theme.
+                print(f"Re-derived '{slug}' from its existing backgrounds.")
+            else:
+                print(f"Wrote theme '{slug}' to {target}")
+            print(describe_mode(dark, lightness, arguments.mode))
 
         for note in transcoded:
             print(f"Converted {note} for the theme background.")

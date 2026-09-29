@@ -27,8 +27,53 @@ Item {
   property string status: ""
   property bool statusIsError: false
 
+  // ------------------------------------------------------------ live refresh
+  // The studio is the only thing that used to change what it shows. Anything
+  // else -- `omarchy theme set` in a terminal, `omarchy theme bg next`, a theme
+  // made with the CLI, a photo dropped into the picked folder -- left the panel
+  // showing a version of the truth that had already stopped being true.
+  //
+  // The active theme is noticed through a watched file, which is instant. A
+  // theme or wallpaper appearing or going is a change to a *directory*, which a
+  // single-file watch cannot see, so the listings are also re-read on a slow
+  // tick while the panel is up. Cheap because the panel is up only while
+  // someone is using it.
+  property bool polling: false
+  // The last raw listing from each query, so a refresh can tell "changed" from
+  // "the same again". Without this the grid's cursor and expansion would be
+  // thrown away every tick even when nothing had happened.
+  property string listedRaw: ""
+  property string candidatesRaw: ""
+  // Flashed when a background refresh found something the studio had not been
+  // told about, so the list changing under the pointer is explained rather than
+  // surprising.
+  property bool refreshed: false
+
   // "New theme" workspace state.
   property string pickDir: home + "/Pictures"
+  // Converted previews for images Qt cannot decode, keyed by the original path.
+  // The value is "" for an image that could not be converted, which is recorded
+  // rather than forgotten so the tile stops asking for it on every reload.
+  property var thumbCache: ({})
+  // One at a time: a grid that spawned a conversion per tile would start a
+  // dozen magick processes at once and thrash the disk for no gain.
+  property var thumbQueue: []
+  property bool thumbBusy: false
+  // The folder browser that picks pickDir. It lives inside the panel because the
+  // studio is a layer-shell surface on the overlay layer: any toplevel window a
+  // desktop file chooser opens composites *behind* it, and an unreachable
+  // window cannot be used to choose a folder.
+  property bool browsing: false
+  property string browsePath: home
+  property string browseParent: ""
+  property string browseError: ""
+  property var browseDirs: []
+  property var browseShortcuts: []
+  property int browseImages: 0
+  property string browseTyped: ""
+  property int browseIndex: 0
+  // A folder asked for while a listing is in flight, run once that one lands.
+  property string browsePending: ""
   property var candidates: []
   property var chosen: []
   property string newName: ""
@@ -40,6 +85,30 @@ Item {
   // would discard edits made on the Colours page. Keeping the colours is the
   // less destructive default, so re-deriving is opt-in.
   property bool keepColors: true
+  // "auto" leaves the mode to the tool, which decides from the images' mean
+  // lightness. Forcing it is the escape hatch for a wallpaper that measures
+  // one way and reads the other -- a bright sky over a dark room, or a set
+  // that lands a hair over the threshold. Kept between openings because the
+  // chip showing which is in use is enough to make it visible, and having to
+  // re-pick it every time would make the option pointless.
+  property string modeChoice: "auto"
+  // True when the mode chips would change the palette. Forcing a mode also
+  // rewrites the colors.toml of a theme whose wallpapers are already stored, so
+  // the button row has to say so before the user commits to it.
+  readonly property bool modeApplies: addTarget === "" || !keepColors
+
+  // True when generating under the typed name would rewrite a theme that already
+  // exists. A forced mode does that even when every wallpaper is already stored,
+  // which is the one case where generating again changes something, so the
+  // button row says so instead of letting it happen silently.
+  readonly property bool rewritesExisting: {
+    if (addTarget !== "" || modeChoice === "auto") return false
+    var wanted = root.slugOf(newName)
+    for (var i = 0; i < themes.length; i++) {
+      if (themes[i].slug === wanted) return true
+    }
+    return false
+  }
   // Set to a slug before reloading so the list can follow a row that changed
   // name, rather than resetting the selection to the active theme.
   property string pendingFollowOld: ""
@@ -88,6 +157,19 @@ Item {
     return 0
   }
 
+  // The browser list is a ".." row plus the subfolders, flattened into one model
+  // so going up is reachable with the same keys as everything else instead of
+  // needing a separate button to find.
+  readonly property var browseRows: {
+    var rows = []
+    if (browseParent !== "") rows.push({ kind: "up", name: "Parent folder", path: browseParent })
+    for (var i = 0; i < browseDirs.length; i++) {
+      rows.push({ kind: "dir", name: browseDirs[i].name,
+                  path: browseDirs[i].path, images: browseDirs[i].images })
+    }
+    return rows
+  }
+
   readonly property var current: selectedIndex >= 0 && selectedIndex < themes.length
                                 ? themes[selectedIndex]
                                 : null
@@ -119,42 +201,62 @@ Item {
 
   // ------------------------------------------------------------------ loading
 
-  function loadThemes() {
+  // `fromPoll` marks a refresh the studio did not ask for, so a change the
+  // studio itself just made is not announced back to the user as news.
+  function loadThemes(fromPoll) {
     if (listProc.running) return
+    polling = fromPoll === true
     listProc.running = true
   }
 
-  function onThemesReady() {
-    // After a rename the old slug is gone; keep the selection on the new name.
+  // Something changed on disk that the studio was not told about. Say so
+  // briefly, then go quiet again: the message is about the panel having moved,
+  // not about a problem.
+  function announceRefresh() {
+    refreshed = true
+    refreshFlash.restart()
+  }
+
+  // The slug is already resolved by the caller, which had to read it before
+  // replacing the model.
+  function onThemesReady(wasSlug) {
+    // Prefer the theme the user had; fall back to the active one, then to
+    // whatever is first. Each is a separate pass because "which is selected" and
+    // "which is active" are different questions.
+    var wantSlug = pendingFollowNew !== "" ? pendingFollowNew : wasSlug
     if (pendingFollowOld !== "") {
-      for (var j = 0; j < themes.length; j++) {
-        if (pendingFollowNew === themes[j].slug) {
-          var keep = j
-          pendingFollowOld = ""
-          pendingFollowNew = ""
-          selectedIndex = keep
-          return
-        }
-      }
       pendingFollowOld = ""
       pendingFollowNew = ""
     }
-    var activeAt = -1
-    for (var k = 0; k < themes.length; k++) {
-      if (themes[k].active) { activeAt = k; break }
-    }
-    if (selectedIndex < 0 || selectedIndex >= themes.length)
-      selectedIndex = activeAt >= 0 ? activeAt : 0
 
-    // The colours on disk are the truth; drop any draft left over from before
-    // the reload, or it would show values that no longer match the theme.
-    if (stack.currentIndex === 2) loadColorDraft()
+    // Prefer the theme the user had; fall back to the active one, then to
+    // whatever is first. Each is a separate pass because "which is selected" and
+    // "which is active" are different questions.
+    var next = -1
+    for (var j = 0; j < themes.length; j++) {
+      if (wantSlug !== "" && themes[j].slug === wantSlug) { next = j; break }
+    }
+    if (next < 0) {
+      for (var k = 0; k < themes.length; k++) {
+        if (themes[k].active) { next = k; break }
+      }
+    }
+    if (next >= 0) selectedIndex = next
+    else if (selectedIndex < 0 || selectedIndex >= themes.length) selectedIndex = 0
+
+    if (polling) announceRefresh()
+    polling = false
+
+    // A passive path, so it must not cost the user their unsaved edits: the
+    // theme may be the same one with a new index, or the colours on disk may
+    // have been edited behind the panel.
+    root.refreshDraft()
   }
 
   // Switching rows while editing colours shows that row's palette, not the
   // previous theme's.
   onSelectedIndexChanged: {
-    if (stack.currentIndex === 2) loadColorDraft()
+    root.refreshDraft()
   }
 
   // Mirrors the tool's slugify so the list can predict the new directory name.
@@ -166,6 +268,69 @@ Item {
   function loadCandidates() {
     if (candidatesProc.running) return
     candidatesProc.running = true
+  }
+
+  // Re-read both listings. Called on a tick and by the watched file; each query
+  // is a small Python run that reads only its own directory, and both are
+  // compared against the last result before anything is rebuilt.
+  function refreshFromDisk() {
+    if (root.inFlight) return
+    loadThemes(true)
+    if (stack.currentIndex === 1) loadCandidates()
+  }
+
+  // True while something the user is waiting on is in flight, or while they are
+  // part-way through a folder listing. Refreshing over the top of either would
+  // race it: a poll landing mid-rename could clear the state the rename follows
+  // the list with, and one landing while the browser is navigating would move
+  // the very folder it is moving through.
+  //
+  // Deliberately does not include the thumbnail conversions. A folder of phone
+  // photos takes seconds to preview, and refusing to refresh for that long
+  // would be the most noticeable way for the live updates to stop working.
+  readonly property bool inFlight: listProc.running || candidatesProc.running
+                                    || renameProc.running || saveColorsProc.running
+                                    || generateProc.running || removeProc.running
+                                    || applyProc.running || setBgProc.running
+                                    || browsing
+
+  Timer {
+    id: refreshFlash
+    interval: 1800
+    onTriggered: root.refreshed = false
+  }
+
+  // The slow backstop, for the changes a single-file watch cannot see: a theme
+  // or a wallpaper appearing or going. Those need a full re-read of the
+  // listing, which costs about 150ms -- most of it the tool's own imports --
+  // so this is deliberately unhurried. The changes a person would notice
+  // happening are the ones the watched file catches instantly, and this only has
+  // to catch the rest.
+  //
+  // It runs only while the panel is up, so the cost is paid only for as long as
+  // someone is looking at the studio.
+  Timer {
+    id: pollTimer
+    interval: 3000
+    repeat: true
+    // Only while the panel is up. A timer nobody can see is a process nobody
+    // wants.
+    running: root.opened
+    onTriggered: root.refreshFromDisk()
+  }
+
+  // The active theme is recorded in a state file omarchy rewrites on
+  // `omarchy theme set`, so watching it makes the ACTIVE badge and the list
+  // follow a theme applied from the terminal.
+  //
+  // Used purely as a notification. The file's own text is not read here: it is
+  // stale in the change signal, so a reload can return the previous theme's
+  // name. The tool is asked for the truth instead, which is one run either way.
+  FileView {
+    path: root.home + "/.local/state/omarchy/current/theme.name"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: root.refreshFromDisk()
   }
 
   // ---------------------------------------------------------------- selection
@@ -182,6 +347,43 @@ Item {
 
   function isChosen(path) {
     return chosen.indexOf(path) !== -1
+  }
+
+  // ------------------------------------------------------------- thumbnails
+
+  // A .HEIC cannot be shown by the shell at all, so the grid would offer it as
+  // an empty box. Converting a preview costs the tool about a second per image
+  // and is cached from then on, so each tile asks once and waits.
+  function requestThumb(entry) {
+    if (!entry || entry.preview !== "") return
+    var path = entry.path
+    if (thumbCache.hasOwnProperty(path)) return
+    for (var i = 0; i < thumbQueue.length; i++) {
+      if (thumbQueue[i] === path) return
+    }
+    thumbQueue = thumbQueue.concat([path])
+    pumpThumbs()
+  }
+
+  function pumpThumbs() {
+    if (thumbBusy || thumbQueue.length === 0) return
+    thumbBusy = true
+    thumbProc.target = thumbQueue[0]
+    thumbProc.command = ["/usr/bin/python3", "-I", root.tool, "--thumb", thumbProc.target]
+    thumbProc.running = true
+  }
+
+  function onThumbReady() {
+    var made = String(thumbProc.output || "").trim().split("\n")[0] || ""
+    // Reassigned whole so every tile's source binding re-evaluates and the new
+    // preview appears without the grid being rebuilt.
+    var next = {}
+    for (var existing in thumbCache) next[existing] = thumbCache[existing]
+    next[thumbProc.target] = made
+    thumbCache = next
+    thumbQueue = thumbQueue.slice(1)
+    thumbBusy = false
+    pumpThumbs()
   }
 
   function baseName(path) {
@@ -282,6 +484,13 @@ Item {
 
   // The draft mirrors the selected theme's colors.toml, so Save only has to
   // send what actually changed.
+  // Which theme the current draft belongs to. The draft cannot be reloaded on
+  // the strength of the row index moving: a theme appearing or disappearing
+  // renumbers every row after it while leaving the selected one untouched, and
+  // reloading on that would throw away unsaved colour edits the moment any
+  // other theme was created or removed.
+  property string draftSlug: ""
+
   function loadColorDraft() {
     var draft = {}
     if (root.current) {
@@ -289,6 +498,17 @@ Item {
       for (var key in saved) draft[key] = saved[key]
     }
     colorDraft = draft
+    draftSlug = selectedTheme()
+  }
+
+  // The one place the draft is refreshed, so the two reasons to refresh cannot
+  // disagree. A different theme always means a fresh draft. The same theme means
+  // reload only if there is nothing unsaved to lose -- which is what lets an
+  // edit made to colors.toml on disk still come through.
+  function refreshDraft() {
+    if (stack.currentIndex !== 2) return
+    if (selectedTheme() === draftSlug && draftIsDirty()) return
+    loadColorDraft()
   }
 
   function draftFor(key) {
@@ -439,10 +659,12 @@ Item {
         say("Give the theme a name.", true)
         return
       }
-      say("Generating theme from " + chosen.length + " image(s)...")
+      say("Generating theme from " + chosen.length + " image(s)"
+          + (modeChoice === "auto" ? "..." : " as " + modeChoice + "..."))
     } else {
       say("Adding " + chosen.length + " image(s) to " + addTarget
-          + (keepColors ? "..." : ", re-deriving its palette..."))
+          + (keepColors ? "..." : ", re-deriving its palette"
+             + (modeChoice === "auto" ? "..." : " as " + modeChoice + "...")))
     }
     generateProc.running = true
   }
@@ -456,21 +678,84 @@ Item {
     } else {
       argv.push("--name", newName.trim())
     }
+    // A forced mode asks for a palette, and the tool takes that as permission to
+    // rewrite colors.toml even when every wallpaper is already stored -- which
+    // is the only way "generate, then generate again as dark" can work. Sending
+    // it only when it applies keeps it from contradicting --keep-colors.
+    if (modeChoice !== "auto" && root.modeApplies) argv.push("--mode", modeChoice)
     return argv
   }
 
-  function chooseDirectory() {
-    var chooser = "/usr/bin/omarchy-file-select"
-    if (pickDirProc.running) return
-    pickDirProc.chooser = chooser
-    pickDirProc.running = true
+  // ------------------------------------------------------------ folder browser
+
+  function openBrowser() {
+    browsing = true
+    browseError = ""
+    // Cleared so a highlight left over from the last browse is not applied to
+    // whatever the listing below turns out to contain.
+    browseIndex = 0
+    browseFolder(root.pickDir)
+    Qt.callLater(function() { browseList.forceActiveFocus() })
   }
 
-  function onDirectoryPicked() {
-    var line = String(pickDirProc.pickedDir || "").trim().split("\n")[0] || ""
-    if (!line) return
-    pickDir = line
+  function closeBrowser() {
+    browsing = false
+    // Hand the keyboard back to whichever pane opened the browser.
+    if (stack.currentIndex === 1) candidateGrid.forceActiveFocus()
+  }
+
+  function browseFolder(path) {
+    var wanted = String(path || "").trim()
+    if (wanted === "") return
+    // A navigation requested while a listing is still running is remembered and
+    // run on exit, so holding a key down cannot drop the folder it lands on.
+    browsePending = wanted
+    if (browseProc.running) return
+    browseProc.command = ["/usr/bin/python3", "-I", root.tool, "--browse", browsePending]
+    browsePending = ""
+    browseProc.running = true
+  }
+
+  function onBrowseReady() {
+    var data = browseProc.payload
+    if (!data || Array.isArray(data)) {
+      browseError = "That folder could not be listed."
+      return
+    }
+    if (data.error) {
+      // Keep the browser open on the last good folder: a mistyped path is a
+      // thing to correct, not a reason to lose the listing.
+      browseError = data.error
+      browseTyped = data.path
+      return
+    }
+    browseError = ""
+    browsePath = data.path
+    browseParent = data.parent || ""
+    browseDirs = data.dirs || []
+    browseShortcuts = data.shortcuts || []
+    browseImages = data.images || 0
+    browseTyped = data.path
+    // The first subfolder, not the ".." row above it: arriving somewhere and
+    // pressing Enter should open what is in it, not immediately go back.
+    browseIndex = browseParent !== "" && browseDirs.length > 0 ? 1 : 0
+  }
+
+  function openBrowseRow(index) {
+    var row = browseRows[index]
+    if (row) browseFolder(row.path)
+  }
+
+  function browseGoUp() {
+    if (browseParent !== "") browseFolder(browseParent)
+  }
+
+  function confirmBrowse() {
+    if (browseError !== "") return
+    pickDir = browsePath
+    closeBrowser()
     loadCandidates()
+    say("Reading wallpapers from " + browsePath)
   }
 
   function dismiss() {
@@ -486,6 +771,8 @@ Item {
     renameText = ""
     pendingFollowOld = ""
     pendingFollowNew = ""
+    browsing = false
+    browseError = ""
   }
 
   // Lifecycle hooks the shell calls on summon/hide.
@@ -516,8 +803,18 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        root.themes = root.parse(text)
-        root.onThemesReady()
+        var raw = String(text || "")
+        // An empty result is a run that failed, not an empty listing, and with a
+        // refresh every few seconds a transient failure would be visible as the
+        // list blinking out and back. Keeping what is on screen is both truer
+        // and less jarring; the next tick will get the real answer.
+        if (raw === "" || raw === root.listedRaw) { root.polling = false; return }
+        root.listedRaw = raw
+        // The slug is taken before the model is replaced, because afterwards
+        // selectedTheme() would report the new list's idea of the selection.
+        var wasSlug = root.selectedTheme()
+        root.themes = root.parse(raw)
+        root.onThemesReady(wasSlug)
       }
     }
     command: ["/usr/bin/python3", "-I", root.tool, "--list"]
@@ -527,23 +824,58 @@ Item {
     id: candidatesProc
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.candidates = root.parse(text)
+      onStreamFinished: {
+        var raw = String(text || "")
+        // Only rebuilt when the folder actually changed, so the grid keeps its
+        // cursor and the tiles keep their previews between ticks. An empty
+        // result is a failed run, not an empty folder.
+        if (raw === "" || raw === root.candidatesRaw) return
+        root.candidatesRaw = raw
+        root.candidates = root.parse(raw)
+      }
     }
     command: ["/usr/bin/python3", "-I", root.tool, "--images-in", root.pickDir]
   }
 
+  // Lists one folder for the in-panel browser. Payload rather than stdout-only
+  // plumbing because a folder that cannot be listed has to reach the UI as data,
+  // not as a process that quietly produced nothing.
   Process {
-    id: pickDirProc
-    property string chooser: ""
-    // Named pickedDir, not stdout: Process already owns `stdout` and assigning
-    // a second one is a duplicate binding, not an override.
-    property string pickedDir: ""
+    id: browseProc
+    property var payload: null
+    command: []
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: pickDirProc.pickedDir = String(text || "")
+      onStreamFinished: browseProc.payload = root.parse(text)
     }
-    onExited: root.onDirectoryPicked()
-    command: [pickDirProc.chooser, "--directory", "--title", "Choose a wallpaper folder"]
+    onExited: {
+      root.onBrowseReady()
+      // A folder asked for while this listing was in flight is stale now, and
+      // the newest request wins. Deferred a tick so this process has finished
+      // detaching before the next one starts, rather than depending on the order
+      // of `running` being cleared against the signal.
+      if (root.browsePending !== "") {
+        var next = root.browsePending
+        root.browsePending = ""
+        Qt.callLater(function() { root.browseFolder(next) })
+      }
+    }
+  }
+
+  // Converts one preview at a time for the picker. Silence on failure is
+  // deliberate: an image the tool cannot read is a tile that keeps its
+  // placeholder, not a fault the user did nothing to cause and cannot fix.
+  Process {
+    id: thumbProc
+    property string target: ""
+    property string output: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: thumbProc.output = String(text || "")
+    }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: root.onThumbReady()
+    command: []
   }
 
   Process {
@@ -776,6 +1108,44 @@ Item {
     }
   }
 
+  // A one-click jump to a folder. Like ActionButton and ToggleChip, an inline
+  // component cannot reach the enclosing `root`, so it reports through a signal.
+  component PathChip: Rectangle {
+    id: pathChip
+    property string label: ""
+    // Marks the folder being browsed, so the row says where "here" is.
+    property bool marked: false
+    signal clicked()
+
+    implicitWidth: pathChipLabel.implicitWidth + Style.space(22)
+    implicitHeight: Style.space(30)
+    radius: Style.cornerRadius
+    color: pathChip.marked ? Color.accent
+                           : (pathChipMouse.containsMouse ? Color.background.lighter(1.25)
+                                                           : Color.background)
+    border.width: 1
+    border.color: pathChip.marked ? Color.accent
+                                  : (pathChipMouse.containsMouse ? Color.accent
+                                                                 : Qt.alpha(Color.foreground, 0.22))
+
+    Text {
+      id: pathChipLabel
+      anchors.centerIn: parent
+      text: pathChip.label
+      color: pathChip.marked ? Color.background : Color.foreground
+      font.pixelSize: Style.font.caption
+      font.weight: Font.DemiBold
+    }
+
+    MouseArea {
+      id: pathChipMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: pathChip.clicked()
+    }
+  }
+
   PanelWindow {
     id: panel
 
@@ -804,8 +1174,11 @@ Item {
       height: 700
       anchors.centerIn: parent
 
-      Keys.onEscapePressed: root.dismiss()
+      // While the folder browser is up it owns the keyboard, so a key it handles
+      // must not fall through to these and close the whole studio.
+      Keys.onEscapePressed: if (!root.browsing) root.dismiss()
       Keys.onPressed: function(event) {
+        if (root.browsing) return
         // Ctrl+Tab / Ctrl+Shift+Tab cycle the panes; the tab strip is otherwise
         // mouse-only, which would strand anyone not using a pointer.
         if (event.key === Qt.Key_Tab && (event.modifiers & Qt.ControlModifier)) {
@@ -901,12 +1274,42 @@ Item {
               anchors.margins: Style.space(10)
               spacing: Style.space(6)
 
-              Text {
-                text: "THEMES  (" + root.themes.length + ")"
-                color: Color.muted
-                font.pixelSize: Style.font.caption
-                font.weight: Font.DemiBold
-                Layout.leftMargin: Style.space(4)
+              RowLayout {
+                Layout.fillWidth: true
+                spacing: Style.space(6)
+
+                Text {
+                  text: "THEMES  (" + root.themes.length + ")"
+                  color: Color.muted
+                  font.pixelSize: Style.font.caption
+                  font.weight: Font.DemiBold
+                  Layout.leftMargin: Style.space(4)
+                }
+
+                // A quiet mark that the list just changed because something
+                // outside the studio did it. Without it, a theme appearing or the
+                // ACTIVE badge moving is just the panel moving under the
+                // pointer with no explanation.
+                Rectangle {
+                  visible: root.refreshed
+                  implicitWidth: refreshNote.implicitWidth + Style.space(14)
+                  implicitHeight: refreshNote.implicitHeight + Style.space(4)
+                  radius: 3
+                  color: Util.alpha(Color.accent, 0.18)
+                  border.width: 1
+                  border.color: Util.alpha(Color.accent, 0.5)
+
+                  Text {
+                    id: refreshNote
+                    anchors.centerIn: parent
+                    text: "UPDATED"
+                    color: Color.accent
+                    font.pixelSize: 8
+                    font.weight: Font.Bold
+                  }
+                }
+
+                Item { Layout.fillWidth: true }
               }
 
               ListView {
@@ -1352,7 +1755,7 @@ Item {
 
                   ActionButton {
                     label: "Choose Folder…"
-                    onClicked: root.chooseDirectory()
+                    onClicked: root.openBrowser()
                   }
                   Text {
                     Layout.fillWidth: true
@@ -1413,6 +1816,15 @@ Item {
 
                     readonly property bool picked: root.isChosen(candidate.modelData.path)
 
+                    // The converted preview once the tool has made it, or the
+                    // original for a format the shell can decode itself. Empty
+                    // until then, which is what the placeholder stands in for.
+                    readonly property string previewPath: {
+                      if (root.thumbCache.hasOwnProperty(candidate.modelData.path))
+                        return root.thumbCache[candidate.modelData.path]
+                      return candidate.modelData.preview
+                    }
+
                     Rectangle {
                       anchors.fill: parent
                       radius: Style.cornerRadius
@@ -1424,11 +1836,50 @@ Item {
                     Image {
                       anchors.fill: parent
                       anchors.margins: 3
-                      source: Util.fileUrl(candidate.modelData.path)
+                      visible: candidate.previewPath !== ""
+                      // Rebound when thumbCache changes, so a preview that did
+                      // not exist when this tile was built still turns up.
+                      source: candidate.previewPath === ""
+                              ? "" : Util.fileUrl(candidate.previewPath)
                       fillMode: Image.PreserveAspectCrop
                       asynchronous: true
                       smooth: true
                       clip: true
+                    }
+
+                    // Names the file and its format until a preview is ready,
+                    // so an image the shell cannot decode is still pickable and
+                    // still identifiable rather than an empty box.
+                    ColumnLayout {
+                      anchors.fill: parent
+                      anchors.margins: Style.space(6)
+                      visible: candidate.previewPath === ""
+                      spacing: Style.space(4)
+
+                      Rectangle {
+                        Layout.alignment: Qt.AlignHCenter
+                        implicitWidth: extLabel.implicitWidth + Style.space(12)
+                        implicitHeight: extLabel.implicitHeight + Style.space(4)
+                        radius: 3
+                        color: Util.alpha(Color.background, 0.72)
+                        Text {
+                          id: extLabel
+                          anchors.centerIn: parent
+                          text: candidate.modelData.ext.toUpperCase()
+                          color: Color.foreground
+                          font.pixelSize: 8
+                          font.weight: Font.Bold
+                        }
+                      }
+
+                      Text {
+                        Layout.fillWidth: true
+                        text: candidate.modelData.name
+                        color: Color.muted
+                        font.pixelSize: 8
+                        horizontalAlignment: Text.AlignHCenter
+                        elide: Text.ElideMiddle
+                      }
                     }
 
                     Rectangle {
@@ -1454,6 +1905,12 @@ Item {
                       cursorShape: Qt.PointingHandCursor
                       onClicked: root.toggleCandidate(candidate.modelData.path)
                     }
+
+                    // Asked for as the tile is built, which is the only moment
+                    // the studio knows the image is somewhere it wants to show.
+                    // requestThumb ignores a format the shell can already show,
+                    // and anything it has converted or given up on before.
+                    Component.onCompleted: root.requestThumb(candidate.modelData)
                   }
                 }
 
@@ -1466,6 +1923,39 @@ Item {
                     label: "Keep current colours"
                     checked: root.keepColors
                     onToggled: root.keepColors = !root.keepColors
+                  }
+
+                  // Auto / Dark / Light. Exclusive, so each chip's checked state
+                  // is bound to the one choice rather than held by itself --
+                  // three independent flags could disagree.
+                  RowLayout {
+                    spacing: Style.space(6)
+                    // Greyed rather than hidden when it would do nothing, so
+                    // the control does not move as the chip above is toggled.
+                    enabled: root.modeApplies
+
+                    Text {
+                      text: "MODE"
+                      color: Color.muted
+                      font.pixelSize: Style.font.caption
+                      font.weight: Font.DemiBold
+                    }
+
+                    ToggleChip {
+                      label: "Auto"
+                      checked: root.modeChoice === "auto"
+                      onToggled: root.modeChoice = "auto"
+                    }
+                    ToggleChip {
+                      label: "Dark"
+                      checked: root.modeChoice === "dark"
+                      onToggled: root.modeChoice = "dark"
+                    }
+                    ToggleChip {
+                      label: "Light"
+                      checked: root.modeChoice === "light"
+                      onToggled: root.modeChoice = "light"
+                    }
                   }
 
                   ActionButton {
@@ -1494,13 +1984,27 @@ Item {
 
                   Item { Layout.fillWidth: true }
 
+                  // One place for every consequence of the row above, so the
+                  // guidance is not split between a chip and a button.
                   Text {
-                    text: root.addTarget !== ""
-                          ? (root.keepColors
-                             ? "Enter to pick, Ctrl+Enter to add. The theme cycles through the set."
-                             : "The palette will be re-derived from the whole set, discarding colour edits.")
-                          : "Enter to pick, Ctrl+Enter to generate. Several images become a set the theme cycles through."
-                    color: root.addTarget !== "" && !root.keepColors ? Color.urgent : Color.muted
+                    text: {
+                      if (root.rewritesExisting)
+                        return "Rewrites " + root.slugOf(root.newName)
+                               + "'s colours from the same wallpapers."
+                      if (root.addTarget !== "") {
+                        return root.keepColors
+                          ? "Enter to pick, Ctrl+Enter to add. The theme cycles through the set."
+                          : "The palette will be re-derived from the whole set, discarding colour edits."
+                      }
+                      if (!root.modeApplies)
+                        return "The theme keeps its colours, so the mode is not used."
+                      return root.modeChoice === "auto"
+                        ? "Enter to pick, Ctrl+Enter to generate. Auto reads the images' mean lightness."
+                        : "Enter to pick, Ctrl+Enter to generate. The mode is forced, the mean lightness ignored."
+                    }
+                    color: root.rewritesExisting
+                           || (root.addTarget !== "" && !root.keepColors)
+                           ? Color.urgent : Color.muted
                     font.pixelSize: Style.font.caption
                     elide: Text.ElideRight
                   }
@@ -1863,6 +2367,284 @@ Item {
                   onClicked: root.showTab(2)
                 }
               }
+            }
+          }
+        }
+      }
+
+      // ---------------------------------------------------------- folder browser
+      // Deliberately inside the panel. The studio is a layer-shell surface on the
+      // overlay layer, so a chooser launched as its own window opens underneath
+      // the panel and behind the scrim, where it can be seen but neither clicked
+      // nor typed into. Browsing here keeps the picker somewhere reachable.
+      Rectangle {
+        id: browser
+        anchors.fill: parent
+        visible: root.browsing
+        z: 100
+        radius: Style.cornerRadius
+        color: Color.background
+        border.width: 1
+        border.color: root.borderColor
+
+        // A Rectangle takes no clicks of its own, so without this a click meant
+        // for the browser lands on the scrim behind the panel and closes it.
+        MouseArea { anchors.fill: parent; onClicked: {} }
+
+        ColumnLayout {
+          anchors.fill: parent
+          anchors.margins: Style.space(20)
+          spacing: Style.space(12)
+
+          // ------------------------------------------------------------ header
+          RowLayout {
+            Layout.fillWidth: true
+            spacing: Style.space(12)
+
+            ColumnLayout {
+              spacing: 0
+              Text {
+                text: "Choose a wallpaper folder"
+                color: Color.foreground
+                font.pixelSize: Style.font.title
+                font.weight: Font.Bold
+              }
+              Text {
+                // browseDirs, not browseRows: the rows also carry the ".."
+                // parent entry, which is not a subfolder of here.
+                text: root.browseImages === 0
+                      ? "No images in this folder"
+                      : root.browseImages + (root.browseImages === 1 ? " image" : " images")
+                        + "  ·  " + root.browseDirs.length
+                        + (root.browseDirs.length === 1 ? " subfolder" : " subfolders")
+                color: root.browseImages === 0 ? Color.muted : Color.accent
+                font.pixelSize: Style.font.caption
+              }
+            }
+
+            Item { Layout.fillWidth: true }
+
+            ActionButton {
+              label: "Close"
+              onClicked: root.closeBrowser()
+            }
+          }
+
+          // A path can be typed as well as walked to, for folders the shortcuts
+          // and the tree do not reach.
+          RowLayout {
+            Layout.fillWidth: true
+            spacing: Style.space(8)
+
+            Rectangle {
+              Layout.fillWidth: true
+              Layout.preferredHeight: Style.space(36)
+              radius: Style.cornerRadius
+              color: Color.background.lighter(1.05)
+              border.width: 1
+              border.color: browseField.activeFocus ? Color.accent : root.borderColor
+
+              TextInput {
+                id: browseField
+                anchors.fill: parent
+                anchors.leftMargin: Style.space(12)
+                anchors.rightMargin: Style.space(12)
+                verticalAlignment: TextInput.AlignVCenter
+                color: Color.foreground
+                font.pixelSize: Style.font.body
+                font.family: "monospace"
+                selectByMouse: true
+                clip: true
+                // onTextEdited, not text, so the field follows a folder the
+                // browser navigated to without the user's own typing breaking
+                // the binding.
+                text: root.browseTyped
+                onTextEdited: root.browseTyped = text
+                onAccepted: root.browseFolder(text)
+                // Escape backs out of the browser, not out of the studio.
+                Keys.onEscapePressed: root.closeBrowser()
+              }
+            }
+
+            ActionButton {
+              label: "Go"
+              enabled: root.browseError === ""
+                       && root.browseTyped.trim() !== ""
+                       && root.browseTyped.trim() !== root.browsePath
+              onClicked: root.browseFolder(browseField.text)
+            }
+          }
+
+          // Where wallpapers usually are, as one click each. A ListView rather
+          // than a Row so a long list of them cannot push the folder list off
+          // the panel.
+          ListView {
+            Layout.fillWidth: true
+            Layout.preferredHeight: Style.space(30)
+            visible: root.browseShortcuts.length > 0
+            orientation: ListView.Horizontal
+            spacing: Style.space(8)
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+            model: root.browseShortcuts
+            ScrollBar.horizontal: ScrollBar { policy: ScrollBar.AsNeeded }
+
+            delegate: PathChip {
+              required property var modelData
+              label: modelData.name
+              marked: modelData.path === root.browsePath
+              // modelData, not the component's inner id: an id declared inside
+              // a component definition is not in scope where it is used.
+              onClicked: root.browseFolder(modelData.path)
+            }
+          }
+
+          // ------------------------------------------------------------ listing
+          Rectangle {
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            radius: Style.cornerRadius
+            color: Color.background.lighter(1.04)
+            border.width: 1
+            border.color: root.borderColor
+
+            ListView {
+              id: browseList
+              anchors.fill: parent
+              anchors.margins: Style.space(4)
+              clip: true
+              model: root.browseRows
+              currentIndex: root.browseIndex
+              focus: true
+              boundsBehavior: Flickable.StopAtBounds
+              ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+              delegate: Rectangle {
+                id: browseRow
+                required property int index
+                required property var modelData
+
+                width: ListView.view.width
+                height: Style.space(44)
+                radius: Style.cornerRadius
+                color: browseRow.index === root.browseIndex ? Color.accent
+                       : (browseRowMouse.containsMouse ? Color.background.lighter(1.12)
+                                                        : "transparent")
+
+                RowLayout {
+                  anchors.fill: parent
+                  anchors.leftMargin: Style.space(12)
+                  anchors.rightMargin: Style.space(12)
+                  spacing: Style.space(10)
+
+                  Text {
+                    Layout.preferredWidth: Style.space(18)
+                    text: browseRow.modelData.kind === "up" ? ".." : "/"
+                    color: browseRow.index === root.browseIndex ? Color.background : Color.muted
+                    font.pixelSize: Style.font.body
+                    font.family: "monospace"
+                  }
+
+                  Text {
+                    Layout.fillWidth: true
+                    text: browseRow.modelData.name
+                    color: browseRow.index === root.browseIndex ? Color.background
+                                                                  : Color.foreground
+                    font.pixelSize: Style.font.body
+                    font.weight: Font.DemiBold
+                    elide: Text.ElideMiddle
+                  }
+
+                  Text {
+                    visible: browseRow.modelData.kind === "dir"
+                    text: browseRow.modelData.images === 0
+                          ? "no images"
+                          : browseRow.modelData.images
+                            + (browseRow.modelData.images === 1 ? " image" : " images")
+                    color: browseRow.index === root.browseIndex
+                           ? Util.alpha(Color.background, 0.75) : Color.muted
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+
+                MouseArea {
+                  id: browseRowMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    root.browseIndex = browseRow.index
+                    root.openBrowseRow(browseRow.index)
+                  }
+                }
+              }
+
+              // Specific handlers for the navigating keys, and onPressed for the
+              // arrows: a specific handler shadows onPressed for its own key, so
+              // each key is handled in exactly one place.
+              Keys.onReturnPressed: root.openBrowseRow(browseList.currentIndex)
+              Keys.onEnterPressed: root.openBrowseRow(browseList.currentIndex)
+              Keys.onRightPressed: root.openBrowseRow(browseList.currentIndex)
+              Keys.onLeftPressed: root.browseGoUp()
+              Keys.onBackPressed: root.browseGoUp()
+              Keys.onEscapePressed: root.closeBrowser()
+
+              Keys.onPressed: function(event) {
+                if (event.key === Qt.Key_Down) {
+                  root.browseIndex = Math.min(root.browseIndex + 1, root.browseRows.length - 1)
+                  return
+                }
+                if (event.key === Qt.Key_Up) {
+                  root.browseIndex = Math.max(root.browseIndex - 1, 0)
+                  return
+                }
+                // Tab has to reach the buttons below, and this handler accepts
+                // everything it is given unless it is told otherwise.
+                if (event.key === Qt.Key_Tab) event.accepted = false
+              }
+            }
+          }
+
+          // ------------------------------------------------------------- footer
+          Text {
+            Layout.fillWidth: true
+            visible: root.browseError !== ""
+            text: root.browseError
+            color: Color.urgent
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideMiddle
+          }
+
+          Text {
+            Layout.fillWidth: true
+            visible: root.browseError === ""
+            text: root.browseRows.length === 0
+                  ? "No subfolders here. Type a path above to go somewhere else."
+                  : "Enter opens the highlighted folder, Left or Backspace goes up, Escape closes."
+            color: Color.muted
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+          }
+
+          RowLayout {
+            Layout.fillWidth: true
+            spacing: Style.space(8)
+
+            ActionButton {
+              label: "Cancel"
+              onClicked: root.closeBrowser()
+            }
+            Item { Layout.fillWidth: true }
+            Text {
+              text: "In use: " + root.pickDir
+              color: Color.muted
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideMiddle
+            }
+            ActionButton {
+              label: "Use This Folder"
+              enabled: root.browseError === "" && root.browsePath !== ""
+              onClicked: root.confirmBrowse()
             }
           }
         }
